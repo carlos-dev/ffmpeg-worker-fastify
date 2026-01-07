@@ -1,21 +1,25 @@
-# Use uma versão leve do Node
 FROM node:20-slim
 
-# Instala FFmpeg (Obrigatório para o fluent-ffmpeg funcionar)
+# 1. Instala o FFmpeg (Obrigatório)
 RUN apt-get update && apt-get install -y ffmpeg
 
-# Define diretório de trabalho
 WORKDIR /app
 
-# Copia e instala dependências
+# 2. Copia os arquivos de dependência
 COPY package*.json ./
-RUN npm install --production
 
-# Copia o resto do código
+# 3. Instala TODAS as dependências (incluindo TypeScript para o build)
+# Removemos o --production aqui para ter acesso ao 'tsc'
+RUN npm install
+
+# 4. Copia o código fonte
 COPY . .
 
-# Expõe a porta (padrão do Fastify/Railway)
+# 5. Roda o Build do TypeScript (Isso cria a pasta /dist)
+RUN npm run build
+
+# 6. Expõe a porta
 EXPOSE 3000
 
-# Inicia o servidor
+# 7. Inicia o servidor compilado
 CMD ["npm", "start"]
