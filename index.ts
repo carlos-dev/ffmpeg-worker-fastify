@@ -30,7 +30,7 @@ const processSchema = {
     required: ['videoUrl', 'startTime', 'duration', 'jobId'],
     properties: {
       videoUrl: { type: 'string', format: 'uri' },
-      startTime: { type: ['string', 'number'] },
+      startTime: { anyOf: [{ type: 'string' }, { type: 'number' }] },
       duration: { type: 'number' },
       jobId: { type: 'string' }
     }
