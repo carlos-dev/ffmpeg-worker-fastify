@@ -54,8 +54,6 @@ function runFFmpeg(input: string, output: string, start: string | number, durati
       '-ss', `${start}`, // Ponto de inicio
       '-t', `${duration}`, // Duração
       '-i', input,       // Arquivo de entrada
-      '-c', 'copy',      // <--- IMPORTANTE: "Copy" não re-renderiza, é instantâneo!
-                         // Se der erro no player, remova essa linha para re-codificar (mais lento).
       output             // Saída
     ];
 
