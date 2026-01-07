@@ -50,12 +50,26 @@ function runFFmpeg(input: string, output: string, start: string | number, durati
     // Monta o comando: ffmpeg -ss 10 -t 5 -i input.mp4 -c copy output.mp4
     // DICA: Colocar -ss antes do -i é muito mais rápido (Input Seeking)
     const args = [
-      '-y',              // Sobrescrever se existir
-      '-ss', `${start}`, // Ponto de inicio
-      '-t', `${duration}`, // Duração
-      '-i', input,       // Arquivo de entrada
-      output             // Saída
+      '-y',                       // Sobrescrever arquivo se existir
+      '-ss', `${start}`,          // Ponto de início
+      '-t', `${duration}`,        // Duração do corte
+      '-i', input,                // Arquivo de entrada
+
+      // Filtro para cortar em 9:16 (Vertical) centralizado
+      // Lógica: "A nova largura será a Altura * (9/16). A altura continua a mesma."
+      '-vf', 'crop=ih*(9/16):ih', 
+      
+      // Codecs obrigatórios para aplicar o filtro e garantir compatibilidade
+      '-c:v', 'libx264',          // Codec de vídeo padrão para web
+      '-preset', 'fast',          // Velocidade vs Compressão (fast é bom para workers)
+      '-c:a', 'aac',              // Codec de áudio padrão
+      '-b:a', '128k',             // Qualidade de áudio
+      '-movflags', '+faststart',  // Otimização para streaming (buffer carrega rápido)
+      
+      output                      // Arquivo de saída
     ];
+
+    console.log('Comando FFmpeg:', 'ffmpeg', args.join(' ')); // Log para você ver o comando rodando
 
     const ffmpegProcess = spawn('ffmpeg', args);
 
