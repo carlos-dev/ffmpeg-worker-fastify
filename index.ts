@@ -24,6 +24,11 @@ interface ProcessVideoBody {
   jobId: string;
 }
 
+interface ExtractAudioBody {
+  videoUrl: string;
+  jobId: string;
+}
+
 const processSchema = {
   body: {
     type: 'object',
@@ -32,6 +37,17 @@ const processSchema = {
       videoUrl: { type: 'string', format: 'uri' },
       startTime: { anyOf: [{ type: 'string' }, { type: 'number' }] },
       duration: { type: 'number' },
+      jobId: { type: 'string' }
+    }
+  }
+};
+
+const extractAudioSchema = {
+  body: {
+    type: 'object',
+    required: ['videoUrl', 'jobId'],
+    properties: {
+      videoUrl: { type: 'string', format: 'uri' },
       jobId: { type: 'string' }
     }
   }
@@ -74,13 +90,48 @@ function runFFmpeg(input: string, output: string, start: string | number, durati
     const ffmpegProcess = spawn('ffmpeg', args);
 
     // Opcional: Logar saída do FFmpeg para debug
-    // ffmpegProcess.stderr.on('data', (data) => console.log(`FFmpeg: ${data}`));
+    ffmpegProcess.stderr.on('data', (data) => console.log(`FFmpeg: ${data}`));
 
     ffmpegProcess.on('close', (code) => {
       if (code === 0) {
         resolve();
       } else {
         reject(new Error(`FFmpeg saiu com código ${code}`));
+      }
+    });
+
+    ffmpegProcess.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+// Função para extrair áudio otimizado para IA (Whisper)
+function extractAudio(input: string, output: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    // FFmpeg otimizado para extração de áudio para transcrição (Whisper)
+    const args = [
+      '-y',                    // Sobrescrever arquivo se existir
+      '-i', input,             // Arquivo de entrada
+      '-vn',                   // Sem vídeo (só áudio)
+      '-acodec', 'libmp3lame', // Codec MP3
+      '-q:a', '4',             // Qualidade 4 (boa qualidade para voz, ~128kbps)
+      '-ar', '16000',          // Sample rate 16kHz (otimizado para Whisper)
+      '-ac', '1',              // Mono (Whisper funciona melhor com mono)
+      output                   // Arquivo de saída
+    ];
+
+    console.log('Comando FFmpeg (Audio):', 'ffmpeg', args.join(' '));
+
+    const ffmpegProcess = spawn('ffmpeg', args);
+
+    ffmpegProcess.stderr.on('data', (data) => console.log(`FFmpeg Audio: ${data}`));
+
+    ffmpegProcess.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg Audio saiu com código ${code}`));
       }
     });
 
@@ -126,6 +177,52 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
   } catch (err) {
     const error = err as Error;
     request.log.error(`[${jobId}] Erro: ${error.message}`);
+    reply.code(500);
+    return { success: false, error: error.message };
+  } finally {
+    try {
+      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    } catch (e) {}
+  }
+});
+
+// Rota para extrair áudio do vídeo (para IA/Whisper)
+fastify.post<{ Body: ExtractAudioBody }>('/extract-audio', { schema: extractAudioSchema }, async (request, reply) => {
+  const { videoUrl, jobId } = request.body;
+  const tempDir = os.tmpdir();
+  const inputPath = path.join(tempDir, `input_audio_${jobId}.mp4`);
+  const outputPath = path.join(tempDir, `audio_${jobId}.mp3`);
+  const finalFileName = `audio/${jobId}_${Date.now()}.mp3`;
+
+  try {
+    request.log.info(`[${jobId}] Baixando vídeo para extração de áudio...`);
+    await downloadFile(videoUrl, inputPath);
+
+    request.log.info(`[${jobId}] Extraindo áudio...`);
+    await extractAudio(inputPath, outputPath);
+
+    request.log.info(`[${jobId}] Fazendo upload do áudio...`);
+    const fileBuffer = fs.readFileSync(outputPath);
+
+    const { error: uploadError } = await supabase
+      .storage
+      .from('audio')
+      .upload(finalFileName, fileBuffer, {
+        contentType: 'audio/mpeg',
+        upsert: true
+      });
+
+    if (uploadError) throw uploadError;
+
+    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/audio/${finalFileName}`;
+
+    request.log.info(`[${jobId}] Áudio extraído com sucesso: ${publicUrl}`);
+    return { success: true, url: publicUrl };
+
+  } catch (err) {
+    const error = err as Error;
+    request.log.error(`[${jobId}] Erro ao extrair áudio: ${error.message}`);
     reply.code(500);
     return { success: false, error: error.message };
   } finally {
