@@ -127,18 +127,24 @@ function extractAudio(input: string, output: string): Promise<void> {
 
     const ffmpegProcess = spawn('ffmpeg', args);
 
-    ffmpegProcess.stderr.on('data', (data) => console.log(`FFmpeg Audio: ${data}`));
+    // Captura COMPLETA do stderr para debug
+    let stderrOutput = '';
+    ffmpegProcess.stderr.on('data', (data) => {
+      const message = data.toString();
+      stderrOutput += message;
+      console.log(`FFmpeg Audio: ${message}`);
+    });
 
     ffmpegProcess.on('close', (code) => {
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`FFmpeg Audio saiu com código ${code}`));
+        reject(new Error(`FFmpeg Audio saiu com código ${code}. Detalhes:\n${stderrOutput}`));
       }
     });
 
     ffmpegProcess.on('error', (err) => {
-      reject(err);
+      reject(new Error(`Erro ao executar FFmpeg: ${err.message}`));
     });
   });
 }
