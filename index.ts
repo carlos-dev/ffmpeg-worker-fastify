@@ -258,7 +258,8 @@ fastify.post<{ Body: ExtractAudioBody }>('/extract-audio', { schema: extractAudi
     request.log.info(`[${jobId}] Fazendo upload do áudio...`);
     const fileBuffer = fs.readFileSync(outputPath);
 
-    const { error: uploadError } = await supabase
+    // Tenta fazer upload
+    let uploadResult = await supabase
       .storage
       .from('audio')
       .upload(finalFileName, fileBuffer, {
@@ -266,7 +267,32 @@ fastify.post<{ Body: ExtractAudioBody }>('/extract-audio', { schema: extractAudi
         upsert: true
       });
 
-    if (uploadError) throw uploadError;
+    // Se o bucket não existir, tenta criar
+    if (uploadResult.error && uploadResult.error.message.includes('Bucket not found')) {
+      request.log.info(`[${jobId}] Bucket 'audio' não existe, criando...`);
+
+      const { error: createBucketError } = await supabase
+        .storage
+        .createBucket('audio', {
+          public: true,
+          fileSizeLimit: 52428800 // 50MB
+        });
+
+      if (createBucketError && !createBucketError.message.includes('already exists')) {
+        throw new Error(`Erro ao criar bucket: ${createBucketError.message}`);
+      }
+
+      // Tenta upload novamente
+      uploadResult = await supabase
+        .storage
+        .from('audio')
+        .upload(finalFileName, fileBuffer, {
+          contentType: 'audio/mpeg',
+          upsert: true
+        });
+    }
+
+    if (uploadResult.error) throw uploadResult.error;
 
     const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/audio/${finalFileName}`;
 
