@@ -107,17 +107,19 @@ function runFFmpeg(input: string, output: string, start: string | number, durati
 }
 
 // Função para extrair áudio otimizado para IA (Whisper)
+// Gera arquivos de ~15MB por hora de áudio (limite Whisper: 25MB)
 function extractAudio(input: string, output: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    // FFmpeg otimizado para extração de áudio para transcrição (Whisper)
+    // Comando otimizado para Whisper (Mono, 32k bitrate)
+    // Isso gera arquivos de ~15MB por hora de duração.
     const args = [
       '-y',                    // Sobrescrever arquivo se existir
       '-i', input,             // Arquivo de entrada
-      '-vn',                   // Sem vídeo (só áudio)
+      '-vn',                   // Remove vídeo
       '-acodec', 'libmp3lame', // Codec MP3
-      '-q:a', '4',             // Qualidade 4 (boa qualidade para voz, ~128kbps)
+      '-ac', '1',              // Mono (Audio Channels = 1) -> Reduz tamanho pela metade
       '-ar', '16000',          // Sample rate 16kHz (otimizado para Whisper)
-      '-ac', '1',              // Mono (Whisper funciona melhor com mono)
+      '-b:a', '32k',           // Bitrate 32k -> Reduz muito o tamanho, mantendo voz clara
       output                   // Arquivo de saída
     ];
 
