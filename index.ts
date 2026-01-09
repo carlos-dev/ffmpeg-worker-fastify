@@ -106,6 +106,34 @@ function runFFmpeg(input: string, output: string, start: string | number, durati
   });
 }
 
+// Função para verificar se o vídeo tem áudio usando ffprobe
+function hasAudioStream(input: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const ffprobeProcess = spawn('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'a:0',
+      '-show_entries', 'stream=codec_type',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      input
+    ]);
+
+    let output = '';
+    ffprobeProcess.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+
+    ffprobeProcess.on('close', (code) => {
+      // Se encontrou stream de áudio, output será "audio"
+      resolve(output.trim() === 'audio');
+    });
+
+    ffprobeProcess.on('error', () => {
+      // Se ffprobe falhar, assumimos que não tem áudio
+      resolve(false);
+    });
+  });
+}
+
 // Função para extrair áudio otimizado para IA (Whisper)
 // Gera arquivos de ~15MB por hora de áudio (limite Whisper: 25MB)
 function extractAudio(input: string, output: string): Promise<void> {
@@ -139,7 +167,13 @@ function extractAudio(input: string, output: string): Promise<void> {
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`FFmpeg Audio saiu com código ${code}. Detalhes:\n${stderrOutput}`));
+        // Detecta se o erro é por falta de áudio
+        if (stderrOutput.includes('does not contain any stream') ||
+            stderrOutput.includes('Output file is empty')) {
+          reject(new Error('O vídeo não contém áudio. Não é possível extrair áudio de um vídeo sem trilha sonora.'));
+        } else {
+          reject(new Error(`FFmpeg Audio saiu com código ${code}. Detalhes:\n${stderrOutput}`));
+        }
       }
     });
 
@@ -206,6 +240,17 @@ fastify.post<{ Body: ExtractAudioBody }>('/extract-audio', { schema: extractAudi
   try {
     request.log.info(`[${jobId}] Baixando vídeo para extração de áudio...`);
     await downloadFile(videoUrl, inputPath);
+
+    request.log.info(`[${jobId}] Verificando se o vídeo tem áudio...`);
+    const hasAudio = await hasAudioStream(inputPath);
+
+    if (!hasAudio) {
+      reply.code(400);
+      return {
+        success: false,
+        error: 'O vídeo não contém áudio. Não é possível extrair áudio de um vídeo sem trilha sonora.'
+      };
+    }
 
     request.log.info(`[${jobId}] Extraindo áudio...`);
     await extractAudio(inputPath, outputPath);
