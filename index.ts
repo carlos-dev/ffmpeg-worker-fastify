@@ -145,7 +145,7 @@ function extractAudio(input: string, output: string): Promise<void> {
       '-i', input,             // Arquivo de entrada
       '-vn',                   // Remove vídeo
       '-acodec', 'libmp3lame', // Codec MP3
-      '-b:a', '64k',         // 64kbps é qualidade de podcast padrão, leve e compatível
+      '-b:a', '32k',         // 32kbps é qualidade de podcast padrão, leve e compatível
       output                   // Arquivo de saída
     ];
 
