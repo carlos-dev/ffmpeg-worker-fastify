@@ -145,9 +145,7 @@ function extractAudio(input: string, output: string): Promise<void> {
       '-i', input,             // Arquivo de entrada
       '-vn',                   // Remove vídeo
       '-acodec', 'libmp3lame', // Codec MP3
-      '-ac', '1',              // Mono (Audio Channels = 1) -> Reduz tamanho pela metade
-      '-ar', '16000',          // Sample rate 16kHz (otimizado para Whisper)
-      '-b:a', '16k',           // Bitrate 16k -> Reduz muito o tamanho, mantendo voz clara
+      '-b:a', '64k',         // 64kbps é qualidade de podcast padrão, leve e compatível
       output                   // Arquivo de saída
     ];
 
