@@ -141,12 +141,16 @@ function extractAudio(input: string, output: string): Promise<void> {
     // Comando otimizado para Whisper (Mono, 32k bitrate)
     // Isso gera arquivos de ~15MB por hora de duração.
     const args = [
-      '-y',                    // Sobrescrever arquivo se existir
-      '-i', input,             // Arquivo de entrada
-      '-vn',                   // Remove vídeo
-      '-acodec', 'libmp3lame', // Codec MP3
-      '-b:a', '32k',         // 32kbps é qualidade de podcast padrão, leve e compatível
-      output                   // Arquivo de saída
+      '-y',
+      '-i', input,
+      '-vn',
+      '-acodec', 'libmp3lame',
+      '-ac', '1',       // Mono
+      '-b:a', '24k',    // Target Bitrate
+      '-minrate', '24k', // Força o mínimo (Impede VBR)
+      '-maxrate', '24k', // Força o máximo (Impede picos de tamanho)
+      '-bufsize', '48k', // Buffer pequeno para manter controle estrito
+      output
     ];
 
     console.log('Comando FFmpeg (Audio):', 'ffmpeg', args.join(' '));
