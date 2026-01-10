@@ -147,11 +147,16 @@ function extractAudio(input: string, output: string): Promise<void> {
       '-acodec', 'libmp3lame',
       '-ac', '1',       // Mono
       '-b:a', '24k',    // Target Bitrate
+      '-ar', '22050',
       '-minrate', '24k', // Força o mínimo (Impede VBR)
       '-maxrate', '24k', // Força o máximo (Impede picos de tamanho)
       '-bufsize', '48k', // Buffer pequeno para manter controle estrito
       output
     ];
+
+    const stats = fs.statSync(output);
+    const sizeInMB = stats.size / (1024 * 1024);
+    console.log(`TAMANHO DO ARQUIVO GERADO: ${sizeInMB.toFixed(2)} MB`);
 
     console.log('Comando FFmpeg (Audio):', 'ffmpeg', args.join(' '));
 
