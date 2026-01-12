@@ -77,6 +77,12 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
       // (iw-ow)/2:(ih-oh)/2 -> Centraliza o corte matematicamente
       '-vf', 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1',
       '-c:v', 'libx264',
+
+      // Força YUV420P. Sem isso, navegadores mostram tela preta se a entrada for diferente.
+      '-pix_fmt', 'yuv420p',
+      // Move os metadados para o início do arquivo. 
+      // Essencial para o vídeo começar a tocar antes de baixar tudo.
+      '-movflags', '+faststart',
       '-c:a', 'aac',
       '-y',
       outputPath
