@@ -8,6 +8,7 @@ import { createClient } from '@supabase/supabase-js';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { Readable } from 'stream';
+import { randomUUID } from 'crypto';
 
 const fastify = Fastify({ logger: true });
 await fastify.register(cors, { origin: true });
@@ -194,9 +195,10 @@ function extractAudio(input: string, output: string): Promise<void> {
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSchema }, async (request, reply) => {
   const { videoUrl, startTime, duration, jobId } = request.body;
   const tempDir = os.tmpdir();
-  const inputPath = path.join(tempDir, `input_${jobId}.mp4`);
-  const outputPath = path.join(tempDir, `output_${jobId}.mp4`);
-  const finalFileName = `cuts/${jobId}_${Date.now()}.mp4`;
+  const executionId = randomUUID();
+  const inputPath = path.join(tempDir, `input_${executionId}.mp4`);
+  const outputPath = path.join(tempDir, `output_${executionId}.mp4`);
+  const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
 
   try {
     request.log.info(`[${jobId}] Baixando...`);
