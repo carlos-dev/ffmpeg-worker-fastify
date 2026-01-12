@@ -68,24 +68,19 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
     const s = Number(start).toFixed(3); 
     const d = Number(duration).toFixed(3);
 
-    const args = [
-      '-i', inputPath,
-      '-ss', s,
-      '-t', d,
-      // --- A MÁGICA DO VERTICAL AQUI ---
-      // crop=h*(9/16):h  -> Define a largura como base na altura (proporção 9:16)
-      // (iw-ow)/2:(ih-oh)/2 -> Centraliza o corte matematicamente
-      '-vf', 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1',
-      '-c:v', 'libx264',
+    const videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
 
-      // Força YUV420P. Sem isso, navegadores mostram tela preta se a entrada for diferente.
-      '-pix_fmt', 'yuv420p',
-      // Move os metadados para o início do arquivo. 
-      // Essencial para o vídeo começar a tocar antes de baixar tudo.
-      '-movflags', '+faststart',
-      '-c:a', 'aac',
-      '-y',
-      outputPath
+    const args = [
+      '-y',                     // Sobrescreve output sempre (primeiro argumento é boa prática)
+      '-i', inputPath,          // Input
+      '-ss', s,                 // Start Time (antes do input ou logo depois é ok, aqui é preciso)
+      '-t', d,                  // Duration
+      '-vf', videoFilter,       // Filtro de Vídeo (Verticalização)
+      '-c:v', 'libx264',        // Codec de Vídeo
+      '-pix_fmt', 'yuv420p',    // Formato de Pixel (Essencial para navegadores)
+      '-c:a', 'aac',            // Codec de Áudio
+      '-movflags', '+faststart',// Otimização para Web
+      outputPath                // Arquivo Final
     ];
 
     console.log(`COMMAND: ffmpeg ${args.join(' ')}`);
@@ -102,16 +97,22 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
     });
 
     ffmpeg.on('close', (code) => {
-      console.error(`FFmpeg ERROR LOGS:\n${stderrData}`);
       if (code === 0) {
         resolve();
       } else {
-        // AQUI ESTÁ O OURO: Mostra por que falhou
-        fastify.log.error(`FFmpeg ERROR LOGS:\n${stderrData}`);
-        reject(new Error(`FFmpeg falhou com código ${code}`));
+        // Loga o erro crítico
+        console.error(`FFmpeg Falhou! Código: ${code}`);
+        console.error(`Detalhes do Erro:\n${stderrData}`);
+        
+        // Tenta identificar o erro comum para ajudar no debug
+        if (stderrData.includes('Invalid crop')) {
+            reject(new Error('Erro de Crop: A resolução do vídeo original não permite este corte vertical.'));
+        } else {
+            reject(new Error(`FFmpeg erro ${code}: Verifique logs.`));
+        }
       }
     });
-    
+
     ffmpeg.on('error', (err) => {
       fastify.log.error(`Falha ao iniciar processo: ${err.message}`);
         reject(new Error(`Falha ao iniciar processo: ${err.message}`));
