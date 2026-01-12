@@ -60,65 +60,6 @@ async function downloadFile(url: string, outputPath: string): Promise<void> {
   await pipeline(Readable.fromWeb(response.body as any), fs.createWriteStream(outputPath));
 }
 
-// Função para rodar FFmpeg nativamente
-fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSchema }, async (request, reply) => {
-  const { videoUrl, startTime, duration, jobId } = request.body;
-  const tempDir = os.tmpdir();
-  const inputPath = path.join(tempDir, `input_${jobId}.mp4`);
-  const outputPath = path.join(tempDir, `output_${jobId}.mp4`);
-  const finalFileName = `cuts/${jobId}_${Date.now()}.mp4`;
-
-  try {
-    // 1. LOG DE AUDITORIA DAS VARIÁVEIS (Isso vai matar a charada)
-    request.log.info(`[${jobId}] --- DADOS RECEBIDOS ---`);
-    request.log.info(`[${jobId}] Start: ${startTime} (Tipo: ${typeof startTime})`);
-    request.log.info(`[${jobId}] Duration: ${duration} (Tipo: ${typeof duration})`);
-
-    // Validação de segurança antes de rodar
-    if (isNaN(Number(startTime)) || isNaN(Number(duration))) {
-        throw new Error(`Valores de tempo inválidos recebidos do n8n. Start: ${startTime}, Duration: ${duration}`);
-    }
-
-    request.log.info(`[${jobId}] Baixando...`);
-    await downloadFile(videoUrl, inputPath); // Use a função nova que te passei antes (com headers)
-
-    // Check do tamanho
-    const stats = fs.statSync(inputPath);
-    request.log.info(`[${jobId}] Arquivo baixado: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-
-    request.log.info(`[${jobId}] Iniciando FFmpeg...`);
-    
-    // Roda o FFmpeg
-    await runFFmpeg(inputPath, outputPath, Number(startTime), Number(duration));
-
-    request.log.info(`[${jobId}] FFmpeg terminou. Verificando output...`);
-    
-    // Verifica se o arquivo existe ANTES de tentar ler
-    if (!fs.existsSync(outputPath)) {
-        throw new Error('O FFmpeg terminou mas o arquivo output não foi criado. Verifique os logs do FFmpeg acima.');
-    }
-
-    const fileBuffer = fs.readFileSync(outputPath);
-
-    // Upload Supabase...
-    // (O resto do seu código de upload continua igual aqui)
-    // ...
-
-    return { success: true, url: '...' }; // Seu retorno
-
-  } catch (err) {
-    const error = err as Error;
-    request.log.error(`[${jobId}] FALHA CRÍTICA: ${error.message}`);
-    reply.code(500);
-    return { success: false, error: error.message };
-  } finally {
-    try {
-      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    } catch (e) {}
-  }
-});
-
 // FUNÇÃO FFmpeg MELHORADA (Para mostrar o erro real)
 function runFFmpeg(inputPath: string, outputPath: string, start: string | number, duration: number): Promise<void> {
   return new Promise((resolve, reject) => {
