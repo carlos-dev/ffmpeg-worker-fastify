@@ -65,8 +65,8 @@ async function downloadFile(url: string, outputPath: string): Promise<void> {
 function runFFmpeg(inputPath: string, outputPath: string, start: string | number, duration: number): Promise<void> {
   return new Promise((resolve, reject) => {
     // Garante que são strings para o array de argumentos
-    const s = start.toString();
-    const d = duration.toString();
+    const s = Number(start).toFixed(3); 
+    const d = Number(duration).toFixed(3);
 
     const args = [
       '-i', inputPath,
@@ -75,8 +75,7 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
       // --- A MÁGICA DO VERTICAL AQUI ---
       // crop=h*(9/16):h  -> Define a largura como base na altura (proporção 9:16)
       // (iw-ow)/2:(ih-oh)/2 -> Centraliza o corte matematicamente
-      '-vf', 'crop=ih*(9/16):ih:(iw-ow)/2:(ih-oh)/2,setsar=1', 
-      // -------------------------------
+      '-vf', 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1',
       '-c:v', 'libx264',
       '-c:a', 'aac',
       '-y',
