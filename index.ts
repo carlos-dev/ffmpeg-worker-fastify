@@ -96,6 +96,7 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
       } else {
         // AQUI ESTÁ O OURO: Mostra por que falhou
         console.error(`FFmpeg ERROR LOGS:\n${stderrData}`);
+        fastify.log.error(`FFmpeg ERROR LOGS:\n${stderrData}`);
         reject(new Error(`FFmpeg falhou com código ${code}`));
       }
     });
