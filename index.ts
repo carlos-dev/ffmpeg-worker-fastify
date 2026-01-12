@@ -61,51 +61,46 @@ async function downloadFile(url: string, outputPath: string): Promise<void> {
 }
 
 // Função para rodar FFmpeg nativamente
-function runFFmpeg(input: string, output: string, start: string | number, duration: number): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    // Monta o comando: ffmpeg -ss 10 -t 5 -i input.mp4 -c copy output.mp4
-    // DICA: Colocar -ss antes do -i é muito mais rápido (Input Seeking)
-    const args = [
-      '-y',                       // Sobrescrever arquivo se existir
-      '-ss', `${start}`,          // Ponto de início
-      '-t', `${duration}`,        // Duração do corte
-      '-i', input,                // Arquivo de entrada
 
-      // Filtro para cortar em 9:16 (Vertical) centralizado
-      // Lógica: "A nova largura será a Altura * (9/16). A altura continua a mesma."
-      '-vf', 'crop=ih*(9/16):ih', 
-      
-      // Codecs obrigatórios para aplicar o filtro e garantir compatibilidade
-      '-c:v', 'libx264',          // Codec de vídeo padrão para web
-      '-preset', 'fast',          // Velocidade vs Compressão (fast é bom para workers)
-      '-c:a', 'aac',              // Codec de áudio padrão
-      '-b:a', '128k',             // Qualidade de áudio
-      '-movflags', '+faststart',  // Otimização para streaming (buffer carrega rápido)
-      
-      output                      // Arquivo de saída
+function runFFmpeg(inputPath: string, outputPath: string, start: string | number, duration: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // Argumentos exatos para corte preciso e rápido
+    const args = [
+      '-i', inputPath,
+      '-ss', start.toString(),
+      '-t', duration.toString(),
+      '-c:v', 'libx264',   // Re-encoda vídeo (mais seguro para compatibilidade)
+      '-c:a', 'aac',       // Re-encoda áudio
+      '-y',                // Sobrescreve se existir
+      outputPath
     ];
 
-    console.log('Comando FFmpeg:', 'ffmpeg', args.join(' ')); // Log para você ver o comando rodando
+    console.log(`Rodando comando: ffmpeg ${args.join(' ')}`);
 
-    const ffmpegProcess = spawn('ffmpeg', args);
+    const ffmpeg = spawn('ffmpeg', args);
 
-    // Opcional: Logar saída do FFmpeg para debug
-    ffmpegProcess.stderr.on('data', (data) => console.log(`FFmpeg: ${data}`));
+    // Captura erros do processo (se o binário não existir)
+    ffmpeg.on('error', (err) => {
+      reject(new Error(`Falha ao iniciar FFmpeg: ${err.message}. Verifique se ele está instalado.`));
+    });
 
-    ffmpegProcess.on('close', (code) => {
+    // Captura logs de erro do FFmpeg (stderr) para debug
+    let errorLogs = '';
+    ffmpeg.stderr.on('data', (data) => {
+      errorLogs += data.toString();
+    });
+
+    // Quando o processo termina
+    ffmpeg.on('close', (code) => {
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`FFmpeg saiu com código ${code}`));
+        console.error('Erro FFmpeg:', errorLogs);
+        reject(new Error(`FFmpeg falhou com código ${code}. Veja logs do servidor.`));
       }
-    });
-
-    ffmpegProcess.on('error', (err) => {
-      reject(err);
     });
   });
 }
-
 // Função para verificar se o vídeo tem áudio usando ffprobe
 function hasAudioStream(input: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
