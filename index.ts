@@ -71,44 +71,65 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
     const videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
 
     const args = [
-      '-y',                     // Sobrescreve output sempre (primeiro argumento é boa prática)
-      '-i', inputPath,          // Input
-      '-ss', s,                 // Start Time (antes do input ou logo depois é ok, aqui é preciso)
+      '-y',                     // Sobrescreve output
+      '-i', inputPath,          // Input File
+      
+      '-ss', s,                 // Start Time
       '-t', d,                  // Duration
-      '-vf', videoFilter,       // Filtro de Vídeo (Verticalização)
-      '-c:v', 'libx264',        // Codec de Vídeo
-      '-pix_fmt', 'yuv420p',    // Formato de Pixel (Essencial para navegadores)
+      
+      // --- MAPEAMENTO EXPLÍCITO (A CORREÇÃO) ---
+      '-map', '0:v:0',          // Pega estritamente o 1º stream de vídeo do input 0
+      '-map', '0:a:0?',         // Pega o 1º stream de áudio (opcional, se existir)
+      
+      // --- VÍDEO ---
+      '-vf', videoFilter,       // Aplica o crop
+      '-c:v', 'libx264',        // Codec H.264
+      '-preset', 'fast',        // Velocidade de encoding (balanceado)
+      '-pix_fmt', 'yuv420p',    // Garante compatibilidade com players web
+      
+      // --- ÁUDIO ---
       '-c:a', 'aac',            // Codec de Áudio
-      '-movflags', '+faststart',// Otimização para Web
-      outputPath                // Arquivo Final
+      '-b:a', '128k',           // Bitrate de áudio seguro
+      
+      // --- METADADOS ---
+      '-movflags', '+faststart',// Otimiza para streaming
+      
+      outputPath
     ];
 
-    console.log(`COMMAND: ffmpeg ${args.join(' ')}`);
+    console.log('FFmpeg Command:', 'ffmpeg', args.join(' '));
 
     const ffmpeg = spawn('ffmpeg', args);
 
-    // CAPTURA O LOG DE ERRO DO FFMPEG
     let stderrData = '';
     
     ffmpeg.stderr.on('data', (data) => {
       stderrData += data.toString();
-      // Descomente a linha abaixo se quiser ver o log em tempo real (pode ser muito texto)
-      // console.log(data.toString()); 
     });
 
     ffmpeg.on('close', (code) => {
       if (code === 0) {
-        resolve();
+        // VERIFICAÇÃO DE INTEGRIDADE
+        try {
+            const stats = fs.statSync(outputPath);
+            console.log(`[FFmpeg Success] Arquivo gerado: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+            
+            if (stats.size < 1000) { // Menor que 1KB = Arquivo vazio/corrompido
+                reject(new Error(`FFmpeg gerou um arquivo vazio (${stats.size} bytes).`));
+                return;
+            }
+            resolve();
+        } catch (e) {
+            reject(new Error('FFmpeg terminou, mas o arquivo de saída não foi encontrado.'));
+        }
       } else {
-        // Loga o erro crítico
-        console.error(`FFmpeg Falhou! Código: ${code}`);
-        console.error(`Detalhes do Erro:\n${stderrData}`);
+        console.error(`FFmpeg ERROR LOGS:\n${stderrData}`);
         
-        // Tenta identificar o erro comum para ajudar no debug
-        if (stderrData.includes('Invalid crop')) {
-            reject(new Error('Erro de Crop: A resolução do vídeo original não permite este corte vertical.'));
+        // Tenta dar uma dica do erro
+        if (stderrData.includes('No such stream')) {
+             reject(new Error('Erro de Stream: O vídeo não possui faixa de vídeo ou áudio compatível.'));
         } else {
-            reject(new Error(`FFmpeg erro ${code}: Verifique logs.`));
+             reject(new Error(`FFmpeg falhou (Código ${code}). Veja logs.`));
         }
       }
     });
