@@ -61,51 +61,109 @@ async function downloadFile(url: string, outputPath: string): Promise<void> {
 }
 
 // Função para rodar FFmpeg nativamente
-function runFFmpeg(input: string, output: string, start: string | number, duration: number): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    // Monta o comando: ffmpeg -ss 10 -t 5 -i input.mp4 -c copy output.mp4
-    // DICA: Colocar -ss antes do -i é muito mais rápido (Input Seeking)
-    const args = [
-      '-y',                       // Sobrescrever arquivo se existir
-      '-ss', `${start}`,          // Ponto de início
-      '-t', `${duration}`,        // Duração do corte
-      '-i', input,                // Arquivo de entrada
+fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSchema }, async (request, reply) => {
+  const { videoUrl, startTime, duration, jobId } = request.body;
+  const tempDir = os.tmpdir();
+  const inputPath = path.join(tempDir, `input_${jobId}.mp4`);
+  const outputPath = path.join(tempDir, `output_${jobId}.mp4`);
+  const finalFileName = `cuts/${jobId}_${Date.now()}.mp4`;
 
-      // Filtro para cortar em 9:16 (Vertical) centralizado
-      // Lógica: "A nova largura será a Altura * (9/16). A altura continua a mesma."
-      '-vf', 'crop=ih*(9/16):ih', 
-      
-      // Codecs obrigatórios para aplicar o filtro e garantir compatibilidade
-      '-c:v', 'libx264',          // Codec de vídeo padrão para web
-      '-preset', 'fast',          // Velocidade vs Compressão (fast é bom para workers)
-      '-c:a', 'aac',              // Codec de áudio padrão
-      '-b:a', '128k',             // Qualidade de áudio
-      '-movflags', '+faststart',  // Otimização para streaming (buffer carrega rápido)
-      
-      output                      // Arquivo de saída
+  try {
+    // 1. LOG DE AUDITORIA DAS VARIÁVEIS (Isso vai matar a charada)
+    request.log.info(`[${jobId}] --- DADOS RECEBIDOS ---`);
+    request.log.info(`[${jobId}] Start: ${startTime} (Tipo: ${typeof startTime})`);
+    request.log.info(`[${jobId}] Duration: ${duration} (Tipo: ${typeof duration})`);
+
+    // Validação de segurança antes de rodar
+    if (isNaN(Number(startTime)) || isNaN(Number(duration))) {
+        throw new Error(`Valores de tempo inválidos recebidos do n8n. Start: ${startTime}, Duration: ${duration}`);
+    }
+
+    request.log.info(`[${jobId}] Baixando...`);
+    await downloadFile(videoUrl, inputPath); // Use a função nova que te passei antes (com headers)
+
+    // Check do tamanho
+    const stats = fs.statSync(inputPath);
+    request.log.info(`[${jobId}] Arquivo baixado: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+
+    request.log.info(`[${jobId}] Iniciando FFmpeg...`);
+    
+    // Roda o FFmpeg
+    await runFFmpeg(inputPath, outputPath, Number(startTime), Number(duration));
+
+    request.log.info(`[${jobId}] FFmpeg terminou. Verificando output...`);
+    
+    // Verifica se o arquivo existe ANTES de tentar ler
+    if (!fs.existsSync(outputPath)) {
+        throw new Error('O FFmpeg terminou mas o arquivo output não foi criado. Verifique os logs do FFmpeg acima.');
+    }
+
+    const fileBuffer = fs.readFileSync(outputPath);
+
+    // Upload Supabase...
+    // (O resto do seu código de upload continua igual aqui)
+    // ...
+
+    return { success: true, url: '...' }; // Seu retorno
+
+  } catch (err) {
+    const error = err as Error;
+    request.log.error(`[${jobId}] FALHA CRÍTICA: ${error.message}`);
+    reply.code(500);
+    return { success: false, error: error.message };
+  } finally {
+    try {
+      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    } catch (e) {}
+  }
+});
+
+// FUNÇÃO FFmpeg MELHORADA (Para mostrar o erro real)
+function runFFmpeg(inputPath: string, outputPath: string, start: string | number, duration: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // Garante que são strings para o array de argumentos
+    const s = start.toString();
+    const d = duration.toString();
+
+    const args = [
+      '-i', inputPath,
+      '-ss', s,
+      '-t', d,
+      '-c:v', 'libx264',
+      '-c:a', 'aac',
+      '-y',
+      outputPath
     ];
 
-    console.log('Comando FFmpeg:', 'ffmpeg', args.join(' ')); // Log para você ver o comando rodando
+    console.log(`COMMAND: ffmpeg ${args.join(' ')}`);
 
-    const ffmpegProcess = spawn('ffmpeg', args);
+    const ffmpeg = spawn('ffmpeg', args);
 
-    // Opcional: Logar saída do FFmpeg para debug
-    ffmpegProcess.stderr.on('data', (data) => console.log(`FFmpeg: ${data}`));
+    // CAPTURA O LOG DE ERRO DO FFMPEG
+    let stderrData = '';
+    
+    ffmpeg.stderr.on('data', (data) => {
+      stderrData += data.toString();
+      // Descomente a linha abaixo se quiser ver o log em tempo real (pode ser muito texto)
+      // console.log(data.toString()); 
+    });
 
-    ffmpegProcess.on('close', (code) => {
+    ffmpeg.on('close', (code) => {
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`FFmpeg saiu com código ${code}`));
+        // AQUI ESTÁ O OURO: Mostra por que falhou
+        console.error(`FFmpeg ERROR LOGS:\n${stderrData}`);
+        reject(new Error(`FFmpeg falhou com código ${code}`));
       }
     });
-
-    ffmpegProcess.on('error', (err) => {
-      reject(err);
+    
+    ffmpeg.on('error', (err) => {
+        reject(new Error(`Falha ao iniciar processo: ${err.message}`));
     });
   });
 }
-
 // Função para verificar se o vídeo tem áudio usando ffprobe
 function hasAudioStream(input: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
