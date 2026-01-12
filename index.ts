@@ -203,7 +203,8 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
     // --- INICIO DO TIRA-TEIMA ---
     const stats = fs.statSync(inputPath);
     request.log.info(`[${jobId}] Tamanho do arquivo baixado: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-
+    request.log.info(`[${jobId}] startTime: ${startTime}`);
+    request.log.info(`[${jobId}] duration: ${duration}`);
     if (stats.size < 10000) { // Se for menor que 10KB, é lixo (HTML ou erro)
         const fileContent = fs.readFileSync(inputPath, 'utf-8');
         throw new Error(`O download falhou! Conteúdo do arquivo: ${fileContent.substring(0, 200)}`);
