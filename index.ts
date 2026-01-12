@@ -72,6 +72,11 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
       '-i', inputPath,
       '-ss', s,
       '-t', d,
+      // --- A MÁGICA DO VERTICAL AQUI ---
+      // crop=h*(9/16):h  -> Define a largura como base na altura (proporção 9:16)
+      // (iw-ow)/2:(ih-oh)/2 -> Centraliza o corte matematicamente
+      '-vf', 'crop=ih*(9/16):ih:(iw-ow)/2:(ih-oh)/2,setsar=1', 
+      // -------------------------------
       '-c:v', 'libx264',
       '-c:a', 'aac',
       '-y',
@@ -204,16 +209,6 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
     request.log.info(`[${jobId}] Baixando...`);
     await downloadFile(videoUrl, inputPath);
 
-    // --- INICIO DO TIRA-TEIMA ---
-    const stats = fs.statSync(inputPath);
-    request.log.info(`[${jobId}] Tamanho do arquivo baixado: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-    request.log.info(`[${jobId}] startTime: ${startTime}`);
-    request.log.info(`[${jobId}] duration: ${duration}`);
-    if (stats.size < 10000) { // Se for menor que 10KB, é lixo (HTML ou erro)
-        const fileContent = fs.readFileSync(inputPath, 'utf-8');
-        throw new Error(`O download falhou! Conteúdo do arquivo: ${fileContent.substring(0, 200)}`);
-    }
-    // --- FIM DO TIRA-TEIMA ---
 
     request.log.info(`[${jobId}] Cortando (Nativo)...`);
 
