@@ -18,17 +18,20 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY || ''
 );
 
+interface Word {
+  start: number;
+  end: number;
+  word: string;
+}
+
 interface ProcessVideoBody {
   videoUrl: string;
   startTime: string | number;
   duration: number;
   jobId: string;
+  words: Word[];
 }
 
-interface ExtractAudioBody {
-  videoUrl: string;
-  jobId: string;
-}
 
 const processSchema = {
   body: {
@@ -61,162 +64,115 @@ async function downloadFile(url: string, outputPath: string): Promise<void> {
   await pipeline(Readable.fromWeb(response.body as any), fs.createWriteStream(outputPath));
 }
 
-// FUNÇÃO FFmpeg MELHORADA (Para mostrar o erro real)
-function runFFmpeg(inputPath: string, outputPath: string, start: string | number, duration: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    // Garante que são strings para o array de argumentos
-    const s = Number(start).toFixed(3); 
-    const d = Number(duration).toFixed(3);
+// --- GERADOR DE SRT ---
+function formatTimeSRT(seconds: number): string {
+  const date = new Date(0);
+  date.setMilliseconds(seconds * 1000);
+  const iso = date.toISOString().substr(11, 12); // HH:mm:ss.sss
+  return iso.replace('.', ','); // SRT usa vírgula
+}
 
-    const videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
+function generateSubtitleFile(words: Word[], globalStartTime: number, outputPath: string): void {
+  let srtContent = '';
+  
+  // Como o vídeo foi cortado, o tempo "0" da legenda deve ser o inicio do corte
+  // Se a palavra começa em 50s e o corte é em 50s, a legenda é em 0s.
+  words.forEach((w, index) => {
+    const relStart = Math.max(0, w.start - globalStartTime);
+    const relEnd = Math.max(0, w.end - globalStartTime);
+    
+    // Filtra palavras que ficaram fora do corte (por segurança)
+    if (relEnd <= relStart) return;
+
+    srtContent += `${index + 1}\n`;
+    srtContent += `${formatTimeSRT(relStart)} --> ${formatTimeSRT(relEnd)}\n`;
+    srtContent += `${w.word}\n\n`;
+  });
+
+  fs.writeFileSync(outputPath, srtContent);
+}
+
+// FUNÇÃO FFmpeg MELHORADA (Para mostrar o erro real)
+function runFFmpeg(inputPath: string, outputPath: string, start: string | number, duration: number, subtitlePath?: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const numStart = Number(start);
+    const numDuration = Number(duration);
+    
+    const s = numStart.toFixed(3);
+    const d = numDuration.toFixed(3);
+
+    // 1. Crop Vertical
+    let videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
+    
+    // 2. Se tiver legenda, adiciona o filtro de subtitles
+    // force_style: Define fonte, tamanho, cor (Amarelo primário), borda preta
+    if (subtitlePath) {
+        // Escapamos o caminho do arquivo para o FFmpeg não se perder
+        const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
+        
+        // Estilo "Viral": Fonte Roboto/Arial, Amarelo Claro (&H00FFFF), Borda Preta Grossa
+        const style = "Fontname=Arial,FontSize=16,PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,BorderStyle=3,Outline=3,Shadow=0,MarginV=60,Alignment=2";
+        videoFilter += `,subtitles='${escapedPath}':force_style='${style}'`;
+    }
 
     const args = [
       '-y',
-      
-      // --- FAST SEEK (A Volta da Velocidade) ---
-      // Colocando -ss ANTES do -i, o FFmpeg pula instantaneamente.
       '-ss', s,                 
       '-t', d,                  
-      
-      '-i', inputPath,          // Input vem depois
-      
+      '-i', inputPath,          
       '-map', '0:v:0',          
       '-map', '0:a:0?',         
-      
       '-vf', videoFilter,       
-      
       '-c:v', 'libx264',        
-      '-preset', 'fast',        // Preset rápido
+      '-preset', 'fast',        
       '-pix_fmt', 'yuv420p',    
-      
       '-c:a', 'aac',            
       '-b:a', '128k',           
-      
       '-movflags', '+faststart',
       outputPath
     ];
+
     console.log('FFmpeg Command:', 'ffmpeg', args.join(' '));
-
     const ffmpeg = spawn('ffmpeg', args);
-
-    let stderrData = '';
     
-    ffmpeg.stderr.on('data', (data) => {
-      stderrData += data.toString();
-    });
-
+    let stderrData = '';
+    ffmpeg.stderr.on('data', d => stderrData += d.toString());
+    
     ffmpeg.on('close', code => {
-      if (code === 0) resolve();
-      else reject(new Error(`FFmpeg error: ${stderrData}`));
+        if (code === 0) resolve();
+        else reject(new Error(`FFmpeg error: ${stderrData}`));
     });
-
-    ffmpeg.on('error', (err) => {
-      fastify.log.error(`Falha ao iniciar processo: ${err.message}`);
-        reject(new Error(`Falha ao iniciar processo: ${err.message}`));
-    });
-  });
-}
-// Função para verificar se o vídeo tem áudio usando ffprobe
-function hasAudioStream(input: string): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const ffprobeProcess = spawn('ffprobe', [
-      '-v', 'error',
-      '-select_streams', 'a:0',
-      '-show_entries', 'stream=codec_type',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
-      input
-    ]);
-
-    let output = '';
-    ffprobeProcess.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    ffprobeProcess.on('close', (code) => {
-      // Se encontrou stream de áudio, output será "audio"
-      resolve(output.trim() === 'audio');
-    });
-
-    ffprobeProcess.on('error', () => {
-      // Se ffprobe falhar, assumimos que não tem áudio
-      resolve(false);
-    });
+    ffmpeg.on('error', err => reject(err));
   });
 }
 
-// Função para extrair áudio otimizado para IA (Whisper)
-// Gera arquivos de ~15MB por hora de áudio (limite Whisper: 25MB)
-function extractAudio(input: string, output: string): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    // Comando otimizado para Whisper (Mono, 32k bitrate)
-    // Isso gera arquivos de ~15MB por hora de duração.
-    const args = [
-      '-y',
-      '-i', input,
-      '-vn',
-      '-acodec', 'libmp3lame',
-      '-ac', '1',       // Mono
-      '-b:a', '24k',    // Target Bitrate
-      '-ar', '22050',
-      '-minrate', '24k', // Força o mínimo (Impede VBR)
-      '-maxrate', '24k', // Força o máximo (Impede picos de tamanho)
-      '-bufsize', '48k', // Buffer pequeno para manter controle estrito
-      output
-    ];
-
-    const stats = fs.statSync(output);
-    const sizeInMB = stats.size / (1024 * 1024);
-    console.log(`TAMANHO DO ARQUIVO GERADO: ${sizeInMB.toFixed(2)} MB`);
-
-    console.log('Comando FFmpeg (Audio):', 'ffmpeg', args.join(' '));
-
-    const ffmpegProcess = spawn('ffmpeg', args);
-
-    // Captura COMPLETA do stderr para debug
-    let stderrOutput = '';
-    ffmpegProcess.stderr.on('data', (data) => {
-      const message = data.toString();
-      stderrOutput += message;
-      console.log(`FFmpeg Audio: ${message}`);
-    });
-
-    ffmpegProcess.on('close', (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        // Detecta se o erro é por falta de áudio
-        if (stderrOutput.includes('does not contain any stream') ||
-            stderrOutput.includes('Output file is empty')) {
-          reject(new Error('O vídeo não contém áudio. Não é possível extrair áudio de um vídeo sem trilha sonora.'));
-        } else {
-          reject(new Error(`FFmpeg Audio saiu com código ${code}. Detalhes:\n${stderrOutput}`));
-        }
-      }
-    });
-
-    ffmpegProcess.on('error', (err) => {
-      reject(new Error(`Erro ao executar FFmpeg: ${err.message}`));
-    });
-  });
-}
 
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSchema }, async (request, reply) => {
-  const { videoUrl, startTime, duration, jobId } = request.body;
+  const { videoUrl, startTime, duration, jobId, words } = request.body;
   const tempDir = os.tmpdir();
   const executionId = randomUUID();
+  
   const inputPath = path.join(tempDir, `input_${executionId}.mp4`);
   const outputPath = path.join(tempDir, `output_${executionId}.mp4`);
+  const subtitlePath = path.join(tempDir, `sub_${executionId}.srt`);
+  
   const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
 
   try {
     request.log.info(`[${jobId}] Baixando...`);
     await downloadFile(videoUrl, inputPath);
 
+    // GERA LEGENDA (Se houver palavras)
+    let subPathArg: string | undefined = undefined;
+    if (words && words.length > 0) {
+        request.log.info(`[${jobId}] Gerando Legendas...`);
+        // Usamos o startTime numerico para calcular o offset
+        generateSubtitleFile(words, Number(startTime), subtitlePath);
+        subPathArg = subtitlePath;
+    }
 
-    request.log.info(`[${jobId}] Cortando (Nativo)...`);
-
-    // Chama nossa função nativa
-    await runFFmpeg(inputPath, outputPath, startTime, duration);
+    request.log.info(`[${jobId}] Renderizando com FFmpeg...`);
+    await runFFmpeg(inputPath, outputPath, startTime, duration, subPathArg);
 
     request.log.info(`[${jobId}] Uploading...`);
     const fileBuffer = fs.readFileSync(outputPath);
@@ -224,15 +180,11 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
     const { error: uploadError } = await supabase
       .storage
       .from('videos')
-      .upload(finalFileName, fileBuffer, {
-        contentType: 'video/mp4',
-        upsert: true
-      });
+      .upload(finalFileName, fileBuffer, { contentType: 'video/mp4', upsert: true });
 
     if (uploadError) throw uploadError;
 
     const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/videos/${finalFileName}`;
-
     return { success: true, url: publicUrl };
 
   } catch (err) {
@@ -244,92 +196,11 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
     try {
       if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
       if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+      if (fs.existsSync(subtitlePath)) fs.unlinkSync(subtitlePath);
     } catch (e) {}
   }
 });
 
-// Rota para extrair áudio do vídeo (para IA/Whisper)
-fastify.post<{ Body: ExtractAudioBody }>('/extract-audio', { schema: extractAudioSchema }, async (request, reply) => {
-  const { videoUrl, jobId } = request.body;
-  const tempDir = os.tmpdir();
-  const inputPath = path.join(tempDir, `input_audio_${jobId}.mp4`);
-  const outputPath = path.join(tempDir, `audio_${jobId}.mp3`);
-  const finalFileName = `audio/${jobId}_${Date.now()}.mp3`;
-
-  try {
-    request.log.info(`[${jobId}] Baixando vídeo para extração de áudio...`);
-    await downloadFile(videoUrl, inputPath);
-
-    request.log.info(`[${jobId}] Verificando se o vídeo tem áudio...`);
-    const hasAudio = await hasAudioStream(inputPath);
-
-    if (!hasAudio) {
-      reply.code(400);
-      return {
-        success: false,
-        error: 'O vídeo não contém áudio. Não é possível extrair áudio de um vídeo sem trilha sonora.'
-      };
-    }
-
-    request.log.info(`[${jobId}] Extraindo áudio...`);
-    await extractAudio(inputPath, outputPath);
-
-    request.log.info(`[${jobId}] Fazendo upload do áudio...`);
-    const fileBuffer = fs.readFileSync(outputPath);
-
-    // Tenta fazer upload
-    let uploadResult = await supabase
-      .storage
-      .from('audio')
-      .upload(finalFileName, fileBuffer, {
-        contentType: 'audio/mpeg',
-        upsert: true
-      });
-
-    // Se o bucket não existir, tenta criar
-    if (uploadResult.error && uploadResult.error.message.includes('Bucket not found')) {
-      request.log.info(`[${jobId}] Bucket 'audio' não existe, criando...`);
-
-      const { error: createBucketError } = await supabase
-        .storage
-        .createBucket('audio', {
-          public: true,
-          fileSizeLimit: 52428800 // 50MB
-        });
-
-      if (createBucketError && !createBucketError.message.includes('already exists')) {
-        throw new Error(`Erro ao criar bucket: ${createBucketError.message}`);
-      }
-
-      // Tenta upload novamente
-      uploadResult = await supabase
-        .storage
-        .from('audio')
-        .upload(finalFileName, fileBuffer, {
-          contentType: 'audio/mpeg',
-          upsert: true
-        });
-    }
-
-    if (uploadResult.error) throw uploadResult.error;
-
-    const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/audio/${finalFileName}`;
-
-    request.log.info(`[${jobId}] Áudio extraído com sucesso: ${publicUrl}`);
-    return { success: true, url: publicUrl };
-
-  } catch (err) {
-    const error = err as Error;
-    request.log.error(`[${jobId}] Erro ao extrair áudio: ${error.message}`);
-    reply.code(500);
-    return { success: false, error: error.message };
-  } finally {
-    try {
-      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    } catch (e) {}
-  }
-});
 
 const start = async () => {
   try {
