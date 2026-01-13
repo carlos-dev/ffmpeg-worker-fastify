@@ -71,32 +71,30 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
     const videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
 
     const args = [
-      '-y',                     // Sobrescreve output
-      '-i', inputPath,          // Input File
+      '-y',
       
-      '-ss', s,                 // Start Time
-      '-t', d,                  // Duration
+      // --- FAST SEEK (A Volta da Velocidade) ---
+      // Colocando -ss ANTES do -i, o FFmpeg pula instantaneamente.
+      '-ss', s,                 
+      '-t', d,                  
       
-      // --- MAPEAMENTO EXPLÍCITO (A CORREÇÃO) ---
-      '-map', '0:v:0',          // Pega estritamente o 1º stream de vídeo do input 0
-      '-map', '0:a:0?',         // Pega o 1º stream de áudio (opcional, se existir)
+      '-i', inputPath,          // Input vem depois
       
-      // --- VÍDEO ---
-      '-vf', videoFilter,       // Aplica o crop
-      '-c:v', 'libx264',        // Codec H.264
-      '-preset', 'fast',        // Velocidade de encoding (balanceado)
-      '-pix_fmt', 'yuv420p',    // Garante compatibilidade com players web
+      '-map', '0:v:0',          
+      '-map', '0:a:0?',         
       
-      // --- ÁUDIO ---
-      '-c:a', 'aac',            // Codec de Áudio
-      '-b:a', '128k',           // Bitrate de áudio seguro
+      '-vf', videoFilter,       
       
-      // --- METADADOS ---
-      '-movflags', '+faststart',// Otimiza para streaming
+      '-c:v', 'libx264',        
+      '-preset', 'fast',        // Preset rápido
+      '-pix_fmt', 'yuv420p',    
       
+      '-c:a', 'aac',            
+      '-b:a', '128k',           
+      
+      '-movflags', '+faststart',
       outputPath
     ];
-
     console.log('FFmpeg Command:', 'ffmpeg', args.join(' '));
 
     const ffmpeg = spawn('ffmpeg', args);
@@ -107,31 +105,9 @@ function runFFmpeg(inputPath: string, outputPath: string, start: string | number
       stderrData += data.toString();
     });
 
-    ffmpeg.on('close', (code) => {
-      if (code === 0) {
-        // VERIFICAÇÃO DE INTEGRIDADE
-        try {
-            const stats = fs.statSync(outputPath);
-            console.log(`[FFmpeg Success] Arquivo gerado: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-            
-            if (stats.size < 1000) { // Menor que 1KB = Arquivo vazio/corrompido
-                reject(new Error(`FFmpeg gerou um arquivo vazio (${stats.size} bytes).`));
-                return;
-            }
-            resolve();
-        } catch (e) {
-            reject(new Error('FFmpeg terminou, mas o arquivo de saída não foi encontrado.'));
-        }
-      } else {
-        console.error(`FFmpeg ERROR LOGS:\n${stderrData}`);
-        
-        // Tenta dar uma dica do erro
-        if (stderrData.includes('No such stream')) {
-             reject(new Error('Erro de Stream: O vídeo não possui faixa de vídeo ou áudio compatível.'));
-        } else {
-             reject(new Error(`FFmpeg falhou (Código ${code}). Veja logs.`));
-        }
-      }
+    ffmpeg.on('close', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`FFmpeg error: ${stderrData}`));
     });
 
     ffmpeg.on('error', (err) => {
