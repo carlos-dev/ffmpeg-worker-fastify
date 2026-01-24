@@ -30,21 +30,71 @@ interface ProcessVideoBody {
   startTime: string | number;
   duration: number;
   jobId: string;
-  words: Word[];
+  words: Word[]; // Obrigatório ter a lista de palavras do Deepgram
 }
 
 const processSchema = {
   body: {
     type: 'object',
-    required: ['videoUrl', 'startTime', 'duration', 'jobId'],
+    required: ['videoUrl', 'startTime', 'duration', 'jobId', 'words'], // Words é obrigatório agora
     properties: {
       videoUrl: { type: 'string', format: 'uri' },
       startTime: { anyOf: [{ type: 'string' }, { type: 'number' }] },
       duration: { type: 'number' },
-      jobId: { type: 'string' }
+      jobId: { type: 'string' },
+      words: { type: 'array' }
     }
   }
 };
+
+// --- NOVA LÓGICA: SNAP TO WORD BOUNDARY ---
+
+/**
+ * Encontra o início exato da palavra mais próxima do tempo alvo.
+ */
+function findExactWordStart(targetTime: number, words: Word[]): number {
+  if (!words || words.length === 0) return targetTime;
+
+  // Encontra a palavra que contém o tempo alvo ou está mais próxima
+  // Ex: Target 10.5. Palavra "Brasil" (10.2 -> 10.8). Retorna 10.2
+  const match = words.find(w => targetTime >= w.start && targetTime <= w.end);
+  
+  if (match) {
+    // Achou a palavra exata que está sendo falada neste segundo
+    return match.start;
+  }
+
+  // Se o corte caiu num silêncio, pega a próxima palavra imediatamente
+  const nextWord = words.find(w => w.start > targetTime);
+  if (nextWord) return nextWord.start;
+
+  return targetTime;
+}
+
+/**
+ * Encontra o fim exato da palavra mais próxima do tempo alvo.
+ */
+function findExactWordEnd(targetTime: number, words: Word[]): number {
+  if (!words || words.length === 0) return targetTime;
+
+  // Encontra a palavra que contém o tempo alvo
+  const match = words.find(w => targetTime >= w.start && targetTime <= w.end);
+  
+  if (match) {
+    return match.end;
+  }
+
+  // Se caiu no silêncio, pega o fim da palavra anterior
+  // Ordenamos reverso para achar a anterior mais próxima
+  const prevWords = words.filter(w => w.end < targetTime);
+  if (prevWords.length > 0) {
+    return prevWords[prevWords.length - 1].end;
+  }
+
+  return targetTime;
+}
+
+// --- FIM DA LÓGICA ---
 
 async function downloadFile(url: string, outputPath: string): Promise<void> {
   const response = await fetch(url);
@@ -62,13 +112,12 @@ function formatTimeSRT(seconds: number): string {
 
 function generateSubtitleFile(words: Word[], globalStartTime: number, outputPath: string): void {
   let srtContent = '';
-  // Pequeno offset visual para a legenda não aparecer antes do áudio
-  const visualOffset = 0.0; 
+  // Pequeno ajuste para a legenda não "piscar" muito rápido
+  const buffer = 0.0; 
 
   words.forEach((w, index) => {
-    // Ajusta o tempo da legenda relativo ao novo corte
-    const relStart = Math.max(0, w.start - globalStartTime + visualOffset);
-    const relEnd = Math.max(0, w.end - globalStartTime + visualOffset);
+    const relStart = Math.max(0, w.start - globalStartTime);
+    const relEnd = Math.max(0, w.end - globalStartTime + buffer);
     
     if (relEnd <= relStart) return;
 
@@ -79,43 +128,33 @@ function generateSubtitleFile(words: Word[], globalStartTime: number, outputPath
   fs.writeFileSync(outputPath, srtContent);
 }
 
-// FUNÇÃO FFmpeg CORRIGIDA (Padding Aditivo)
-function runFFmpeg(inputPath: string, outputPath: string, start: number, originalDuration: number, subtitlePath?: string): Promise<void> {
+function runFFmpeg(inputPath: string, outputPath: string, start: number, end: number, subtitlePath?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     
-    // 1. ESTRATÉGIA "OPUS CLIP":
-    // Não cortamos no tempo exato. Nós expandimos.
-    // - Recuamos 0.15s no início (para pegar a respiração/ataque)
-    // - Avançamos 0.25s no final (para pegar o eco e dar espaço pro fade)
-    
-    const PAD_START = 0.15;
-    const PAD_END = 0.25;
+    // --- SEGURANÇA DE CORTE (BUFFER) ---
+    // Agora que sabemos o tempo EXATO da palavra, damos um respiro minúsculo.
+    // Start: Tira 0.1s para pegar a inspiração.
+    // End: Adiciona 0.15s para pegar o "s" ou "r" final.
+    const SAFE_START = Math.max(0, start - 0.10);
+    const SAFE_END = end + 0.15;
+    const duration = SAFE_END - SAFE_START;
 
-    // Garante que não recuamos para antes de 0
-    const finalStart = Math.max(0, start - PAD_START);
-    
-    // O tempo de duração total aumenta com os paddings
-    const finalDuration = originalDuration + (start - finalStart) + PAD_END;
+    const s = SAFE_START.toFixed(3);
+    const d = duration.toFixed(3);
 
-    const s = finalStart.toFixed(3);
-    const d = finalDuration.toFixed(3);
-
-    // Filtros de vídeo
+    // Filtros
     let videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
     
     if (subtitlePath) {
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
-      // Fonte Arial Bold, Amarela, Borda Grossa
       const style = "Fontname=Arial Bold,FontSize=24,PrimaryColour=&H0000FFFF,OutlineColour=&H80000000,BorderStyle=3,Outline=4,Shadow=0,MarginV=70,Alignment=2";
       videoFilter += `,subtitles='${escapedPath}':force_style='${style}'`;
     }
 
-    // FADE DE ÁUDIO "SAFE"
-    // O Fade In acontece DURANTE o padding inicial (antes da palavra começar)
-    // O Fade Out acontece DURANTE o padding final (depois da palavra acabar)
-    // Resultado: A palavra fica 100% audível e limpa.
-    const fadeOutStart = finalDuration - PAD_END; 
-    const audioFilter = `afade=t=in:st=0:d=${PAD_START},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${PAD_END}`;
+    // FADE SUAVE E CURTO
+    // Como o corte já está na fronteira da palavra, um fade curto (0.05) tira o "click" digital sem comer a voz.
+    const fadeOutStart = duration - 0.1;
+    const audioFilter = `afade=t=in:st=0:d=0.05,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.1`;
 
     const args = [
       '-y',
@@ -126,18 +165,15 @@ function runFFmpeg(inputPath: string, outputPath: string, start: number, origina
       '-map', '0:a:0?',         
       '-vf', videoFilter,       
       '-af', audioFilter,       
-      '-c:v', 'libx264',        // Re-encode para precisão
-      '-preset', 'fast',        
-      '-crf', '23',             
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',             
       '-pix_fmt', 'yuv420p',    
-      '-c:a', 'aac',            
-      '-b:a', '192k',
+      '-c:a', 'aac', '-b:a', '192k',
       '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart',
       outputPath
     ];
 
-    console.log(`[FFmpeg] Processando: Start=${s}, Duration=${d} (Com Paddings)`);
+    console.log(`[FFmpeg] Word-Snap: ${s} -> ${d} (Original Req: ${start.toFixed(2)}-${end.toFixed(2)})`);
     const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args);
     
     let stderrData = '';
@@ -150,6 +186,8 @@ function runFFmpeg(inputPath: string, outputPath: string, start: number, origina
     ffmpeg.on('error', err => reject(err));
   });
 }
+
+// --- ROTA PRINCIPAL ---
 
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSchema }, async (request, reply) => {
   const { videoUrl, startTime, duration, jobId, words } = request.body;
@@ -166,25 +204,31 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
     request.log.info(`[${jobId}] Baixando vídeo...`);
     await downloadFile(videoUrl, inputPath);
 
-    const numStart = Number(startTime);
-    const numDuration = Number(duration);
+    // --- ALINHAMENTO POR PALAVRA (O PULO DO GATO) ---
+    // Ignoramos a precisão do GPT e confiamos na precisão do Deepgram
+    const rawStart = Number(startTime);
+    const rawEnd = rawStart + Number(duration);
 
-    // GERA LEGENDA (Usando o padding para alinhar)
+    // 1. Acha o INÍCIO REAL da palavra onde o GPT mandou cortar
+    const snappedStart = findExactWordStart(rawStart, words);
+    
+    // 2. Acha o FIM REAL da palavra onde o GPT mandou parar
+    const snappedEnd = findExactWordEnd(rawEnd, words);
+
+    request.log.info(`[${jobId}] 🎯 Snap: GPT(${rawStart.toFixed(2)}-${rawEnd.toFixed(2)}) -> WORD(${snappedStart.toFixed(2)}-${snappedEnd.toFixed(2)})`);
+
+    // GERA LEGENDA (Usando o tempo alinhado - 0.10s de buffer que o FFmpeg vai colocar)
     let subPathArg: string | undefined = undefined;
     if (words && words.length > 0) {
-        request.log.info(`[${jobId}] Gerando Legendas...`);
-        // Precisamos compensar o padding inicial que o FFmpeg vai adicionar
-        // Se o vídeo começa 0.15s antes, a legenda tem que "esperar" 0.15s para aparecer
-        const PAD_START = 0.15;
-        const adjustedStartForSubs = Math.max(0, numStart - PAD_START);
-        generateSubtitleFile(words, adjustedStartForSubs, subtitlePath);
+        // Compensamos o SAFE_START (0.10s) que vamos adicionar no FFmpeg
+        const subOffset = Math.max(0, snappedStart - 0.10);
+        generateSubtitleFile(words, subOffset, subtitlePath);
         subPathArg = subtitlePath;
     }
 
     request.log.info(`[${jobId}] Renderizando...`);
-    
-    // Passa os tempos ORIGINAIS. O runFFmpeg que vai calcular os paddings extras.
-    await runFFmpeg(inputPath, outputPath, numStart, numDuration, subPathArg);
+    // Passamos os tempos ALINHADOS. O runFFmpeg aplicará o buffer de segurança.
+    await runFFmpeg(inputPath, outputPath, snappedStart, snappedEnd, subPathArg);
 
     request.log.info(`[${jobId}] Uploading...`);
     const fileBuffer = fs.readFileSync(outputPath);
@@ -217,7 +261,7 @@ const start = async () => {
   try {
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
     await fastify.listen({ port, host: '0.0.0.0' });
-    console.log(`Worker Nativo (Safe Padding) rodando na porta ${port}`);
+    console.log(`Worker Nativo (Word Snapping) rodando na porta ${port}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
