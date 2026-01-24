@@ -46,117 +46,6 @@ const processSchema = {
   }
 };
 
-// --- INTELIGÊNCIA DE ÁUDIO (SMART CUT V2 - EXPANSIVE) ---
-
-interface SilenceInterval {
-  start: number;
-  end: number;
-  duration: number;
-}
-
-// 1. Scanner de Silêncio
-const detectSilences = (filePath: string, noiseDb = -30, minDuration = 0.2): Promise<SilenceInterval[]> => {
-  return new Promise((resolve, reject) => {
-    const silences: SilenceInterval[] = [];
-    
-    // Diminuímos minDuration para 0.2s para pegar pausas mais curtas de respiração
-    const ffmpeg = spawn(ffmpegPath || 'ffmpeg', [
-      '-i', filePath,
-      '-af', `silencedetect=noise=${noiseDb}dB:d=${minDuration}`,
-      '-f', 'null',
-      '-'
-    ]);
-
-    let logData = '';
-    ffmpeg.stderr.on('data', d => logData += d.toString());
-
-    ffmpeg.on('close', (code) => {
-      if (code !== 0) return resolve([]); 
-
-      const lines = logData.split('\n');
-      let currentStart: number | null = null;
-
-      for (const line of lines) {
-        if (line.includes('silence_start')) {
-          const match = line.match(/silence_start:\s+([0-9.]+)/);
-          if (match) currentStart = parseFloat(match[1]);
-        } 
-        else if (line.includes('silence_end') && currentStart !== null) {
-          const match = line.match(/silence_end:\s+([0-9.]+)/);
-          if (match) {
-            const end = parseFloat(match[1]);
-            silences.push({ start: currentStart, end: end, duration: end - currentStart });
-            currentStart = null;
-          }
-        }
-      }
-      resolve(silences);
-    });
-  });
-};
-
-// 2. Ajustador de Tempo (Expansivo)
-const snapToSilence = (targetTime: number, silences: SilenceInterval[], type: 'start' | 'end'): number => {
-  // CONFIGURAÇÕES DE FOLGA (PADDING)
-  const START_BUFFER = 0.15; // 150ms antes da palavra começar (pega respiração)
-  const END_BUFFER = 0.20;   // 200ms depois da palavra terminar (pega eco)
-
-  if (type === 'start') {
-    // LÓGICA DE INÍCIO:
-    // Queremos encontrar o silêncio que termina ANTES do nosso targetTime.
-    // Dentre eles, pegamos o que termina MAIS PERTO do targetTime (o último silêncio antes da fala).
-    
-    const previousSilences = silences.filter(s => s.end < targetTime);
-    
-    // Se não achou silêncio antes (é o começo do vídeo ou fala contínua), aplica buffer padrão
-    if (previousSilences.length === 0) {
-      return Math.max(0, targetTime - START_BUFFER);
-    }
-
-    // Pega o último silêncio antes da fala
-    const bestSilence = previousSilences[previousSilences.length - 1];
-    
-    // Verifica a distância. Se o silêncio estiver muito longe (> 2s), ignora e usa buffer padrão
-    if (targetTime - bestSilence.end > 2.0) {
-       return Math.max(0, targetTime - START_BUFFER);
-    }
-
-    // O ponto de corte ideal é o FINAL desse silêncio - BUFFER.
-    // Mas não podemos invadir o inicio desse mesmo silêncio.
-    const idealStart = bestSilence.end - START_BUFFER;
-    
-    // Garante que não recuamos tanto a ponto de pegar a palavra anterior
-    return Math.max(bestSilence.start + 0.05, idealStart); 
-  } 
-  else {
-    // LÓGICA DE FIM:
-    // Queremos encontrar o silêncio que começa DEPOIS do nosso targetTime.
-    // Dentre eles, pegamos o que começa MAIS PERTO (o primeiro silêncio após a fala).
-    
-    const nextSilences = silences.filter(s => s.start > targetTime);
-
-    if (nextSilences.length === 0) {
-      return targetTime + END_BUFFER;
-    }
-
-    const bestSilence = nextSilences[0];
-
-    // Se o silêncio estiver muito longe, ignora
-    if (bestSilence.start - targetTime > 2.0) {
-        return targetTime + END_BUFFER;
-    }
-
-    // O ponto de corte ideal é o INÍCIO desse silêncio + BUFFER.
-    // Isso garante que pegamos o "rabo" da voz entrando no silêncio.
-    const idealEnd = bestSilence.start + END_BUFFER;
-
-    // Garante que não avançamos tanto a ponto de pegar a próxima palavra
-    return Math.min(bestSilence.end - 0.05, idealEnd);
-  }
-};
-
-// --- FUNÇÕES UTILITÁRIAS ---
-
 async function downloadFile(url: string, outputPath: string): Promise<void> {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Falha ao baixar: ${response.statusText}`);
@@ -173,16 +62,15 @@ function formatTimeSRT(seconds: number): string {
 
 function generateSubtitleFile(words: Word[], globalStartTime: number, outputPath: string): void {
   let srtContent = '';
-  words.forEach((w, index) => {
-    // Expande a janela da legenda levemente para garantir que não suma
-    const wordStartAdjusted = w.start - 0.1;
-    const wordEndAdjusted = w.end + 0.1;
+  // Pequeno offset visual para a legenda não aparecer antes do áudio
+  const visualOffset = 0.0; 
 
-    const relStart = Math.max(0, wordStartAdjusted - globalStartTime);
-    const relEnd = Math.max(0, wordEndAdjusted - globalStartTime);
+  words.forEach((w, index) => {
+    // Ajusta o tempo da legenda relativo ao novo corte
+    const relStart = Math.max(0, w.start - globalStartTime + visualOffset);
+    const relEnd = Math.max(0, w.end - globalStartTime + visualOffset);
     
-    // Se a palavra termina antes do corte começar, ignora
-    if (relEnd <= 0) return;
+    if (relEnd <= relStart) return;
 
     srtContent += `${index + 1}\n`;
     srtContent += `${formatTimeSRT(relStart)} --> ${formatTimeSRT(relEnd)}\n`;
@@ -191,26 +79,43 @@ function generateSubtitleFile(words: Word[], globalStartTime: number, outputPath
   fs.writeFileSync(outputPath, srtContent);
 }
 
-// FUNÇÃO FFmpeg REFORÇADA (Audio Fade + Video Precision)
-function runFFmpeg(inputPath: string, outputPath: string, start: number, duration: number, subtitlePath?: string): Promise<void> {
+// FUNÇÃO FFmpeg CORRIGIDA (Padding Aditivo)
+function runFFmpeg(inputPath: string, outputPath: string, start: number, originalDuration: number, subtitlePath?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     
-    const s = start.toFixed(3);
-    const d = duration.toFixed(3);
+    // 1. ESTRATÉGIA "OPUS CLIP":
+    // Não cortamos no tempo exato. Nós expandimos.
+    // - Recuamos 0.15s no início (para pegar a respiração/ataque)
+    // - Avançamos 0.25s no final (para pegar o eco e dar espaço pro fade)
+    
+    const PAD_START = 0.15;
+    const PAD_END = 0.25;
 
-    // Crop Vertical para Shorts
+    // Garante que não recuamos para antes de 0
+    const finalStart = Math.max(0, start - PAD_START);
+    
+    // O tempo de duração total aumenta com os paddings
+    const finalDuration = originalDuration + (start - finalStart) + PAD_END;
+
+    const s = finalStart.toFixed(3);
+    const d = finalDuration.toFixed(3);
+
+    // Filtros de vídeo
     let videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
     
     if (subtitlePath) {
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
+      // Fonte Arial Bold, Amarela, Borda Grossa
       const style = "Fontname=Arial Bold,FontSize=24,PrimaryColour=&H0000FFFF,OutlineColour=&H80000000,BorderStyle=3,Outline=4,Shadow=0,MarginV=70,Alignment=2";
       videoFilter += `,subtitles='${escapedPath}':force_style='${style}'`;
     }
 
-    // FADE DE ÁUDIO MAIS CURTO E PRECISO
-    // Fade IN: 0.05s (50ms) - Ultra rápido para não comer a primeira letra
-    // Fade OUT: 0.1s (100ms) - Suave no final
-    const audioFilter = `afade=t=in:st=0:d=0.05,afade=t=out:st=${(duration - 0.1).toFixed(3)}:d=0.1`;
+    // FADE DE ÁUDIO "SAFE"
+    // O Fade In acontece DURANTE o padding inicial (antes da palavra começar)
+    // O Fade Out acontece DURANTE o padding final (depois da palavra acabar)
+    // Resultado: A palavra fica 100% audível e limpa.
+    const fadeOutStart = finalDuration - PAD_END; 
+    const audioFilter = `afade=t=in:st=0:d=${PAD_START},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${PAD_END}`;
 
     const args = [
       '-y',
@@ -221,9 +126,9 @@ function runFFmpeg(inputPath: string, outputPath: string, start: number, duratio
       '-map', '0:a:0?',         
       '-vf', videoFilter,       
       '-af', audioFilter,       
-      '-c:v', 'libx264',        // Re-encoding obrigatório para precisão
+      '-c:v', 'libx264',        // Re-encode para precisão
       '-preset', 'fast',        
-      '-crf', '23',             // Qualidade visual constante
+      '-crf', '23',             
       '-pix_fmt', 'yuv420p',    
       '-c:a', 'aac',            
       '-b:a', '192k',
@@ -232,7 +137,7 @@ function runFFmpeg(inputPath: string, outputPath: string, start: number, duratio
       outputPath
     ];
 
-    console.log('FFmpeg Command:', 'ffmpeg', args.join(' '));
+    console.log(`[FFmpeg] Processando: Start=${s}, Duration=${d} (Com Paddings)`);
     const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args);
     
     let stderrData = '';
@@ -246,10 +151,8 @@ function runFFmpeg(inputPath: string, outputPath: string, start: number, duratio
   });
 }
 
-// --- ROTA PRINCIPAL ---
-
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSchema }, async (request, reply) => {
-  const { videoUrl, startTime: rawStartTime, duration: rawDuration, jobId, words } = request.body;
+  const { videoUrl, startTime, duration, jobId, words } = request.body;
   const tempDir = os.tmpdir();
   const executionId = randomUUID();
   
@@ -260,37 +163,28 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
   const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
 
   try {
-    request.log.info(`[${jobId}] Baixando vídeo original...`);
+    request.log.info(`[${jobId}] Baixando vídeo...`);
     await downloadFile(videoUrl, inputPath);
 
-    // 1. Mapeia Silêncios
-    request.log.info(`[${jobId}] 🕵️‍♂️ Mapeando silêncios (Smart Cut V2)...`);
-    const silences = await detectSilences(inputPath);
-    request.log.info(`[${jobId}] ✅ ${silences.length} intervalos de silêncio.`);
+    const numStart = Number(startTime);
+    const numDuration = Number(duration);
 
-    // 2. Calcula tempos otimizados (EXPANSÃO)
-    const nStart = Number(rawStartTime);
-    const nEnd = nStart + Number(rawDuration);
-
-    const smartStart = snapToSilence(nStart, silences, 'start');
-    const smartEnd = snapToSilence(nEnd, silences, 'end');
-    
-    // Recalcula duração baseada no ajuste
-    const smartDuration = smartEnd - smartStart;
-
-    request.log.info(`[${jobId}] ✂️ Ajuste: ${nStart}->${smartStart.toFixed(2)} | Fim: ${nEnd}->${smartEnd.toFixed(2)}`);
-
-    // 3. Gera Legenda (Com tempo ajustado)
+    // GERA LEGENDA (Usando o padding para alinhar)
     let subPathArg: string | undefined = undefined;
     if (words && words.length > 0) {
         request.log.info(`[${jobId}] Gerando Legendas...`);
-        // Importante: passa o smartStart para sincronizar
-        generateSubtitleFile(words, smartStart, subtitlePath);
+        // Precisamos compensar o padding inicial que o FFmpeg vai adicionar
+        // Se o vídeo começa 0.15s antes, a legenda tem que "esperar" 0.15s para aparecer
+        const PAD_START = 0.15;
+        const adjustedStartForSubs = Math.max(0, numStart - PAD_START);
+        generateSubtitleFile(words, adjustedStartForSubs, subtitlePath);
         subPathArg = subtitlePath;
     }
 
-    request.log.info(`[${jobId}] Renderizando com FFmpeg...`);
-    await runFFmpeg(inputPath, outputPath, smartStart, smartDuration, subPathArg);
+    request.log.info(`[${jobId}] Renderizando...`);
+    
+    // Passa os tempos ORIGINAIS. O runFFmpeg que vai calcular os paddings extras.
+    await runFFmpeg(inputPath, outputPath, numStart, numDuration, subPathArg);
 
     request.log.info(`[${jobId}] Uploading...`);
     const fileBuffer = fs.readFileSync(outputPath);
@@ -323,7 +217,7 @@ const start = async () => {
   try {
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
     await fastify.listen({ port, host: '0.0.0.0' });
-    console.log(`Worker Nativo (Smart Cut V2) rodando na porta ${port}`);
+    console.log(`Worker Nativo (Safe Padding) rodando na porta ${port}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
