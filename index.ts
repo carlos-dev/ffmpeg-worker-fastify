@@ -4,7 +4,7 @@ import path from 'path';
 import os from 'os';
 import { pipeline } from 'stream/promises';
 import { spawn } from 'child_process';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'; // R2 usa SDK do S3
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { Readable } from 'stream';
@@ -14,76 +14,125 @@ import ffmpegPath from 'ffmpeg-static';
 const fastify = Fastify({ logger: true });
 await fastify.register(cors, { origin: true });
 
-// --- CONFIGURAÇÃO R2 (CLOUDFLARE) ---
-const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME || '';
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || '';
+// --- CONFIGURAÇÃO S3 / R2 ---
+// Ajuste conforme seu provedor (AWS S3, Cloudflare R2, DigitalOcean Spaces, etc)
+const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME || process.env.R2_BUCKET_NAME || '';
+const S3_REGION = process.env.S3_REGION || 'auto';
+const S3_ENDPOINT = process.env.S3_ENDPOINT || process.env.R2_ENDPOINT || '';
 
-const r2Client = new S3Client({
-  region: 'auto',
-  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+const s3Client = new S3Client({
+  region: S3_REGION,
+  endpoint: S3_ENDPOINT,
   credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID || '',
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || '',
+    accessKeyId: process.env.S3_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY || '',
   },
 });
 
 function getPublicUrl(fileName: string) {
-  // Ajuste sua URL pública do R2 aqui se tiver domínio customizado
-  const publicDomain = process.env.R2_PUBLIC_DOMAIN; 
-  if (publicDomain) return `${publicDomain}/${fileName}`;
-  return `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${R2_BUCKET_NAME}/${fileName}`;
+  // Se tiver domínio público configurado
+  if (process.env.PUBLIC_MEDIA_URL) {
+    return `${process.env.PUBLIC_MEDIA_URL}/${fileName}`;
+  }
+  // Fallback genérico (pode precisar ajuste dependendo se é R2 ou AWS)
+  return `${S3_ENDPOINT}/${S3_BUCKET_NAME}/${fileName}`;
 }
 
-// ... (RESTO DAS INTERFACES IGUAIS) ...
-interface Word { start: number; end: number; word: string; }
-interface ProcessVideoBody {
-  videoUrl: string; startTime: string | number; duration: number; jobId: string; words: Word[];
+interface Word {
+  start: number;
+  end: number;
+  word: string;
 }
+
+interface ProcessVideoBody {
+  videoUrl: string;
+  startTime: string | number;
+  duration: number;
+  jobId: string;
+  words: Word[];
+}
+
 const processSchema = {
   body: {
     type: 'object',
-    required: ['videoUrl', 'startTime', 'duration', 'jobId'],
+    required: ['videoUrl', 'startTime', 'duration', 'jobId', 'words'],
     properties: {
       videoUrl: { type: 'string', format: 'uri' },
       startTime: { anyOf: [{ type: 'string' }, { type: 'number' }] },
       duration: { type: 'number' },
       jobId: { type: 'string' },
-      words: { type: 'array' } // Opcional se não mandar
+      words: { type: 'array' }
     }
   }
 };
 
-// ... (DOWNLOAD FILE, FORMAT TIME, GENERATE SUBTITLE MANTEM IGUAL) ...
 async function downloadFile(url: string, outputPath: string): Promise<void> {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Falha ao baixar: ${response.statusText}`);
-    await pipeline(Readable.fromWeb(response.body as any), fs.createWriteStream(outputPath));
-}
-function formatTimeSRT(seconds: number): string {
-    const date = new Date(0); date.setMilliseconds(seconds * 1000);
-    return date.toISOString().substr(11, 12).replace('.', ','); 
-}
-function generateSubtitleFile(words: Word[], globalStartTime: number, outputPath: string): void {
-    let srtContent = ''; const syncOffset = 0.0; 
-    words.forEach((w, index) => {
-        const relStart = Math.max(0, w.start - globalStartTime + syncOffset);
-        const relEnd = Math.max(0, w.end - globalStartTime + syncOffset);
-        if (relEnd <= relStart) return;
-        srtContent += `${index + 1}\n${formatTimeSRT(relStart)} --> ${formatTimeSRT(relEnd)}\n${w.word}\n\n`;
-    });
-    fs.writeFileSync(outputPath, srtContent);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Falha ao baixar: ${response.statusText}`);
+  await pipeline(Readable.fromWeb(response.body as any), fs.createWriteStream(outputPath));
 }
 
-// ... (RUN FFMPEG - LOOSE CUT MANTEM IGUAL) ...
-function runFFmpeg(inputPath: string, outputPath: string, reqStart: number, reqDuration: number, subtitlePath?: string): Promise<void> {
+function formatTimeSRT(seconds: number): string {
+  const date = new Date(0);
+  date.setMilliseconds(seconds * 1000);
+  const iso = date.toISOString().substr(11, 12); 
+  return iso.replace('.', ','); 
+}
+
+// --- LÓGICA DE ALINHAMENTO ---
+function findExactWordStart(targetTime: number, words: Word[]): number {
+    if (!words || words.length === 0) return targetTime;
+    // Acha a palavra que cobre o targetTime
+    const match = words.find(w => targetTime >= w.start && targetTime <= w.end);
+    if (match) return match.start;
+    // Se não achar (silêncio), pega a próxima
+    const next = words.find(w => w.start > targetTime);
+    return next ? next.start : targetTime;
+}
+
+function findExactWordEnd(targetTime: number, words: Word[]): number {
+    if (!words || words.length === 0) return targetTime;
+    const match = words.find(w => targetTime >= w.start && targetTime <= w.end);
+    if (match) return match.end;
+    // Se não achar (silêncio), pega a anterior
+    const prev = words.filter(w => w.end < targetTime).pop();
+    return prev ? prev.end : targetTime;
+}
+
+function generateSubtitleFile(words: Word[], globalStartTime: number, outputPath: string): void {
+  let srtContent = '';
+  // Pequeno ajuste para a legenda
+  const syncOffset = 0.0; 
+
+  words.forEach((w, index) => {
+    const relStart = Math.max(0, w.start - globalStartTime + syncOffset);
+    const relEnd = Math.max(0, w.end - globalStartTime + syncOffset);
+    if (relEnd <= relStart) return;
+
+    srtContent += `${index + 1}\n`;
+    srtContent += `${formatTimeSRT(relStart)} --> ${formatTimeSRT(relEnd)}\n`;
+    srtContent += `${w.word}\n\n`;
+  });
+  fs.writeFileSync(outputPath, srtContent);
+}
+
+// --- FFMPEG COM BUFFER GIGANTE ---
+function runFFmpeg(inputPath: string, outputPath: string, wordStart: number, wordEnd: number, subtitlePath?: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const PAD_START = 0.10; 
-    const PAD_END = 0.25;
-    const finalStart = Math.max(0, reqStart - PAD_START);
-    const finalDuration = reqDuration + (reqStart - finalStart) + PAD_END;
+    
+    // MARGEM DE SEGURANÇA GIGANTE
+    // Se a palavra começa em 10.0, começamos o vídeo em 9.7 (0.3s antes)
+    // Se a palavra termina em 20.0, terminamos o vídeo em 20.4 (0.4s depois)
+    const BUFFER_START = 0.30; 
+    const BUFFER_END = 0.40;
+
+    const finalStart = Math.max(0, wordStart - BUFFER_START);
+    const finalEnd = wordEnd + BUFFER_END;
+    const duration = finalEnd - finalStart;
 
     const s = finalStart.toFixed(3);
-    const d = finalDuration.toFixed(3);
+    const d = duration.toFixed(3);
+
     let videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
     
     if (subtitlePath) {
@@ -91,19 +140,32 @@ function runFFmpeg(inputPath: string, outputPath: string, reqStart: number, reqD
       const style = "Fontname=Arial Bold,FontSize=24,PrimaryColour=&H0000FFFF,OutlineColour=&H80000000,BorderStyle=3,Outline=4,Shadow=0,MarginV=70,Alignment=2";
       videoFilter += `,subtitles='${escapedPath}':force_style='${style}'`;
     }
-    const fadeOutStart = finalDuration - PAD_END;
-    const audioFilter = `afade=t=in:st=0:d=${PAD_START},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${PAD_END}`;
+
+    // LÓGICA DE ÁUDIO PROTEGIDA:
+    // Fade In: Apenas nos primeiros 0.1s (sobram 0.2s de áudio limpo antes da palavra)
+    // Fade Out: Apenas nos últimos 0.15s (sobram 0.25s de áudio limpo depois da palavra)
+    const fadeOutStart = duration - 0.15;
+    const audioFilter = `afade=t=in:st=0:d=0.1,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
     const args = [
-      '-y', '-ss', s, '-i', inputPath, '-t', d, 
-      '-map', '0:v:0', '-map', '0:a:0?', 
-      '-vf', videoFilter, '-af', audioFilter, 
-      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p',    
+      '-y',
+      '-ss', s,                 
+      '-i', inputPath,          
+      '-t', d,                  
+      '-map', '0:v:0',          
+      '-map', '0:a:0?',         
+      '-vf', videoFilter,       
+      '-af', audioFilter,       
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',             
+      '-pix_fmt', 'yuv420p',    
       '-c:a', 'aac', '-b:a', '192k',
-      '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart',
+      '-avoid_negative_ts', 'make_zero', // Garante sincronia
+      '-movflags', '+faststart',
       outputPath
     ];
-    console.log(`[FFmpeg] Loose Cut: ${s} -> ${d}`);
+
+    console.log(`[FFmpeg] SAFE CUT: Palavra(${wordStart.toFixed(2)}-${wordEnd.toFixed(2)}) -> Video(${s}-${(parseFloat(s)+parseFloat(d)).toFixed(3)})`);
+    
     const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args);
     let stderrData = '';
     ffmpeg.stderr.on('data', d => stderrData += d.toString());
@@ -127,25 +189,34 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
     request.log.info(`[${jobId}] Baixando...`);
     await downloadFile(videoUrl, inputPath);
 
-    const numStart = Number(startTime);
-    const numDuration = Number(duration);
-    let subPathArg: string | undefined = undefined;
+    const rawStart = Number(startTime);
+    const rawEnd = rawStart + Number(duration);
 
+    // 1. ACHA OS LIMITES REAIS DA PALAVRA
+    const exactStart = findExactWordStart(rawStart, words);
+    const exactEnd = findExactWordEnd(rawEnd, words);
+
+    request.log.info(`[${jobId}] Alinhamento: GPT(${rawStart}-${rawEnd}) -> REAL(${exactStart}-${exactEnd})`);
+
+    // GERA LEGENDA
+    // Compensamos o BUFFER_START (0.30s) que vamos adicionar no FFmpeg
+    let subPathArg: string | undefined = undefined;
     if (words && words.length > 0) {
-        const PAD_START = 0.10;
-        generateSubtitleFile(words, Math.max(0, numStart - PAD_START), subtitlePath);
+        const BUFFER_START = 0.30;
+        const subOffset = Math.max(0, exactStart - BUFFER_START);
+        generateSubtitleFile(words, subOffset, subtitlePath);
         subPathArg = subtitlePath;
     }
 
-    request.log.info(`[${jobId}] Renderizando (Loose Cut)...`);
-    await runFFmpeg(inputPath, outputPath, numStart, numDuration, subPathArg);
+    request.log.info(`[${jobId}] Renderizando com Buffer Gigante...`);
+    // Passamos os tempos EXATOS da palavra. O FFmpeg vai adicionar os 0.3s/0.4s extras.
+    await runFFmpeg(inputPath, outputPath, exactStart, exactEnd, subPathArg);
 
-    request.log.info(`[${jobId}] Uploading to R2...`);
+    request.log.info(`[${jobId}] Uploading to S3...`);
     const fileBuffer = fs.readFileSync(outputPath);
 
-    // --- UPLOAD R2 ---
-    await r2Client.send(new PutObjectCommand({
-      Bucket: R2_BUCKET_NAME,
+    await s3Client.send(new PutObjectCommand({
+      Bucket: S3_BUCKET_NAME,
       Key: finalFileName,
       Body: fileBuffer,
       ContentType: 'video/mp4'
@@ -172,7 +243,7 @@ const start = async () => {
   try {
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
     await fastify.listen({ port, host: '0.0.0.0' });
-    console.log(`Worker R2 rodando na porta ${port}`);
+    console.log(`Worker S3 (Buffer Gigante) rodando na porta ${port}`);
   } catch (err) { fastify.log.error(err); process.exit(1); }
 };
 start();
