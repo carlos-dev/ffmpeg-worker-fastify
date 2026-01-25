@@ -15,7 +15,6 @@ const fastify = Fastify({ logger: true });
 await fastify.register(cors, { origin: true });
 
 // --- CONFIGURAÇÃO S3 / R2 ---
-// Ajuste conforme seu provedor (AWS S3, Cloudflare R2, DigitalOcean Spaces, etc)
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME || process.env.R2_BUCKET_NAME || '';
 const S3_REGION = process.env.S3_REGION || 'auto';
 const S3_ENDPOINT = process.env.S3_ENDPOINT || process.env.R2_ENDPOINT || '';
@@ -30,11 +29,9 @@ const s3Client = new S3Client({
 });
 
 function getPublicUrl(fileName: string) {
-  // Se tiver domínio público configurado
   if (process.env.PUBLIC_MEDIA_URL) {
     return `${process.env.PUBLIC_MEDIA_URL}/${fileName}`;
   }
-  // Fallback genérico (pode precisar ajuste dependendo se é R2 ou AWS)
   return `${S3_ENDPOINT}/${S3_BUCKET_NAME}/${fileName}`;
 }
 
@@ -46,8 +43,9 @@ interface Word {
 
 interface ProcessVideoBody {
   videoUrl: string;
-  startTime: string | number;
-  duration: number;
+  startTime: number;
+  endTime?: number;      // Novo: tempo exato do fim
+  duration?: number;     // Mantido para compatibilidade
   jobId: string;
   words: Word[];
 }
@@ -55,10 +53,11 @@ interface ProcessVideoBody {
 const processSchema = {
   body: {
     type: 'object',
-    required: ['videoUrl', 'startTime', 'duration', 'jobId', 'words'],
+    required: ['videoUrl', 'startTime', 'jobId', 'words'],
     properties: {
       videoUrl: { type: 'string', format: 'uri' },
-      startTime: { anyOf: [{ type: 'string' }, { type: 'number' }] },
+      startTime: { type: 'number' },
+      endTime: { type: 'number' },
       duration: { type: 'number' },
       jobId: { type: 'string' },
       words: { type: 'array' }
@@ -79,58 +78,96 @@ function formatTimeSRT(seconds: number): string {
   return iso.replace('.', ','); 
 }
 
-// --- LÓGICA DE ALINHAMENTO ---
-function findExactWordStart(targetTime: number, words: Word[]): number {
-    if (!words || words.length === 0) return targetTime;
-    // Acha a palavra que cobre o targetTime
-    const match = words.find(w => targetTime >= w.start && targetTime <= w.end);
-    if (match) return match.start;
-    // Se não achar (silêncio), pega a próxima
-    const next = words.find(w => w.start > targetTime);
-    return next ? next.start : targetTime;
+// --- LÓGICA DE ALINHAMENTO PRECISO ---
+
+// Encontra a primeira palavra que começa em ou após o tempo alvo
+function findFirstWordAtOrAfter(targetTime: number, words: Word[]): Word | null {
+  if (!words || words.length === 0) return null;
+  
+  // Ordena por tempo de início para garantir
+  const sorted = [...words].sort((a, b) => a.start - b.start);
+  
+  // Encontra a primeira palavra que começa em ou após targetTime
+  // Com tolerância de 0.05s para evitar problemas de precisão float
+  const tolerance = 0.05;
+  return sorted.find(w => w.start >= targetTime - tolerance) || null;
 }
 
-function findExactWordEnd(targetTime: number, words: Word[]): number {
-    if (!words || words.length === 0) return targetTime;
-    const match = words.find(w => targetTime >= w.start && targetTime <= w.end);
-    if (match) return match.end;
-    // Se não achar (silêncio), pega a anterior
-    const prev = words.filter(w => w.end < targetTime).pop();
-    return prev ? prev.end : targetTime;
+// Encontra a última palavra que termina em ou antes do tempo alvo
+function findLastWordAtOrBefore(targetTime: number, words: Word[]): Word | null {
+  if (!words || words.length === 0) return null;
+  
+  const sorted = [...words].sort((a, b) => a.start - b.start);
+  const tolerance = 0.05;
+  
+  // Filtra palavras que terminam antes ou no tempo alvo
+  const candidates = sorted.filter(w => w.end <= targetTime + tolerance);
+  
+  // Retorna a última
+  return candidates.length > 0 ? candidates[candidates.length - 1] : null;
 }
 
-function generateSubtitleFile(words: Word[], globalStartTime: number, outputPath: string): void {
+// Calcula o ponto de corte ideal no SILÊNCIO entre palavras
+function calculateSafeStartPoint(firstWord: Word, words: Word[]): number {
+  const sorted = [...words].sort((a, b) => a.start - b.start);
+  const idx = sorted.findIndex(w => w.start === firstWord.start);
+  
+  if (idx <= 0) {
+    // É a primeira palavra - usa pequeno buffer antes
+    return Math.max(0, firstWord.start - 0.15);
+  }
+  
+  const prevWord = sorted[idx - 1];
+  const silenceGap = firstWord.start - prevWord.end;
+  
+  // Ponto de corte: meio do silêncio, mas nunca mais que 0.3s antes da palavra
+  const midSilence = prevWord.end + (silenceGap / 2);
+  const maxBuffer = firstWord.start - 0.3;
+  
+  return Math.max(midSilence, maxBuffer, 0);
+}
+
+function calculateSafeEndPoint(lastWord: Word, words: Word[]): number {
+  const sorted = [...words].sort((a, b) => a.start - b.start);
+  const idx = sorted.findIndex(w => w.start === lastWord.start);
+  
+  if (idx === -1 || idx >= sorted.length - 1) {
+    // É a última palavra - usa pequeno buffer depois
+    return lastWord.end + 0.2;
+  }
+  
+  const nextWord = sorted[idx + 1];
+  const silenceGap = nextWord.start - lastWord.end;
+  
+  // Ponto de corte: meio do silêncio, mas nunca mais que 0.3s depois da palavra
+  const midSilence = lastWord.end + (silenceGap / 2);
+  const maxBuffer = lastWord.end + 0.3;
+  
+  return Math.min(midSilence, maxBuffer);
+}
+
+function generateSubtitleFile(words: Word[], videoStartTime: number, outputPath: string): void {
   let srtContent = '';
-  // Pequeno ajuste para a legenda
-  const syncOffset = 0.0; 
 
   words.forEach((w, index) => {
-    const relStart = Math.max(0, w.start - globalStartTime + syncOffset);
-    const relEnd = Math.max(0, w.end - globalStartTime + syncOffset);
+    // Tempo relativo ao início do vídeo cortado
+    const relStart = Math.max(0, w.start - videoStartTime);
+    const relEnd = Math.max(0, w.end - videoStartTime);
+    
     if (relEnd <= relStart) return;
 
     srtContent += `${index + 1}\n`;
     srtContent += `${formatTimeSRT(relStart)} --> ${formatTimeSRT(relEnd)}\n`;
     srtContent += `${w.word}\n\n`;
   });
+  
   fs.writeFileSync(outputPath, srtContent);
 }
 
-// --- FFMPEG COM BUFFER GIGANTE ---
-function runFFmpeg(inputPath: string, outputPath: string, wordStart: number, wordEnd: number, subtitlePath?: string): Promise<void> {
+function runFFmpeg(inputPath: string, outputPath: string, cutStart: number, cutEnd: number, subtitlePath?: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    
-    // MARGEM DE SEGURANÇA GIGANTE
-    // Se a palavra começa em 10.0, começamos o vídeo em 9.7 (0.3s antes)
-    // Se a palavra termina em 20.0, terminamos o vídeo em 20.4 (0.4s depois)
-    const BUFFER_START = 0.30; 
-    const BUFFER_END = 0.40;
-
-    const finalStart = Math.max(0, wordStart - BUFFER_START);
-    const finalEnd = wordEnd + BUFFER_END;
-    const duration = finalEnd - finalStart;
-
-    const s = finalStart.toFixed(3);
+    const duration = cutEnd - cutStart;
+    const s = cutStart.toFixed(3);
     const d = duration.toFixed(3);
 
     let videoFilter = 'crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:(ih-oh)/2,setsar=1';
@@ -141,10 +178,8 @@ function runFFmpeg(inputPath: string, outputPath: string, wordStart: number, wor
       videoFilter += `,subtitles='${escapedPath}':force_style='${style}'`;
     }
 
-    // LÓGICA DE ÁUDIO PROTEGIDA:
-    // Fade In: Apenas nos primeiros 0.1s (sobram 0.2s de áudio limpo antes da palavra)
-    // Fade Out: Apenas nos últimos 0.15s (sobram 0.25s de áudio limpo depois da palavra)
-    const fadeOutStart = duration - 0.15;
+    // Fade suave apenas nas bordas (0.1s)
+    const fadeOutStart = Math.max(0, duration - 0.15);
     const audioFilter = `afade=t=in:st=0:d=0.1,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
     const args = [
@@ -159,12 +194,12 @@ function runFFmpeg(inputPath: string, outputPath: string, wordStart: number, wor
       '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',             
       '-pix_fmt', 'yuv420p',    
       '-c:a', 'aac', '-b:a', '192k',
-      '-avoid_negative_ts', 'make_zero', // Garante sincronia
+      '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart',
       outputPath
     ];
 
-    console.log(`[FFmpeg] SAFE CUT: Palavra(${wordStart.toFixed(2)}-${wordEnd.toFixed(2)}) -> Video(${s}-${(parseFloat(s)+parseFloat(d)).toFixed(3)})`);
+    console.log(`[FFmpeg] Corte preciso: ${s}s -> ${(parseFloat(s) + parseFloat(d)).toFixed(3)}s (duração: ${d}s)`);
     
     const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args);
     let stderrData = '';
@@ -175,7 +210,12 @@ function runFFmpeg(inputPath: string, outputPath: string, wordStart: number, wor
 }
 
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSchema }, async (request, reply) => {
-  const { videoUrl, startTime, duration, jobId, words } = request.body;
+  const { videoUrl, startTime, endTime, duration, jobId, words } = request.body;
+  
+  // Calcula o tempo final (suporta tanto endTime quanto duration para compatibilidade)
+  const rawStart = Number(startTime);
+  const rawEnd = endTime ? Number(endTime) : rawStart + Number(duration);
+  
   const tempDir = os.tmpdir();
   const executionId = randomUUID();
   
@@ -186,33 +226,46 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
   const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
 
   try {
-    request.log.info(`[${jobId}] Baixando...`);
+    request.log.info(`[${jobId}] Baixando vídeo...`);
     await downloadFile(videoUrl, inputPath);
 
-    const rawStart = Number(startTime);
-    const rawEnd = rawStart + Number(duration);
+    request.log.info(`[${jobId}] Tempos recebidos: início=${rawStart.toFixed(2)}s, fim=${rawEnd.toFixed(2)}s`);
+    request.log.info(`[${jobId}] Palavras recebidas: ${words.length}`);
 
-    // 1. ACHA OS LIMITES REAIS DA PALAVRA
-    const exactStart = findExactWordStart(rawStart, words);
-    const exactEnd = findExactWordEnd(rawEnd, words);
+    // 1. ENCONTRA AS PALAVRAS ÂNCORA
+    const firstWord = findFirstWordAtOrAfter(rawStart, words);
+    const lastWord = findLastWordAtOrBefore(rawEnd, words);
 
-    request.log.info(`[${jobId}] Alinhamento: GPT(${rawStart}-${rawEnd}) -> REAL(${exactStart}-${exactEnd})`);
-
-    // GERA LEGENDA
-    // Compensamos o BUFFER_START (0.30s) que vamos adicionar no FFmpeg
-    let subPathArg: string | undefined = undefined;
-    if (words && words.length > 0) {
-        const BUFFER_START = 0.30;
-        const subOffset = Math.max(0, exactStart - BUFFER_START);
-        generateSubtitleFile(words, subOffset, subtitlePath);
-        subPathArg = subtitlePath;
+    if (!firstWord || !lastWord) {
+      throw new Error(`Não foi possível alinhar com palavras. Início: ${!!firstWord}, Fim: ${!!lastWord}`);
     }
 
-    request.log.info(`[${jobId}] Renderizando com Buffer Gigante...`);
-    // Passamos os tempos EXATOS da palavra. O FFmpeg vai adicionar os 0.3s/0.4s extras.
-    await runFFmpeg(inputPath, outputPath, exactStart, exactEnd, subPathArg);
+    request.log.info(`[${jobId}] Primeira palavra: "${firstWord.word}" (${firstWord.start.toFixed(2)}s)`);
+    request.log.info(`[${jobId}] Última palavra: "${lastWord.word}" (${lastWord.end.toFixed(2)}s)`);
 
-    request.log.info(`[${jobId}] Uploading to S3...`);
+    // 2. CALCULA PONTOS DE CORTE SEGUROS (no silêncio entre palavras)
+    const safeStart = calculateSafeStartPoint(firstWord, words);
+    const safeEnd = calculateSafeEndPoint(lastWord, words);
+
+    request.log.info(`[${jobId}] Corte seguro: ${safeStart.toFixed(3)}s -> ${safeEnd.toFixed(3)}s`);
+
+    // 3. FILTRA PALAVRAS PARA LEGENDA (apenas as que estão no corte)
+    const wordsInCut = words.filter(w => w.start >= firstWord.start && w.end <= lastWord.end);
+    
+    // 4. GERA LEGENDA
+    let subPathArg: string | undefined = undefined;
+    if (wordsInCut.length > 0) {
+      generateSubtitleFile(wordsInCut, safeStart, subtitlePath);
+      subPathArg = subtitlePath;
+      request.log.info(`[${jobId}] Legenda gerada com ${wordsInCut.length} palavras`);
+    }
+
+    // 5. EXECUTA FFMPEG
+    request.log.info(`[${jobId}] Renderizando...`);
+    await runFFmpeg(inputPath, outputPath, safeStart, safeEnd, subPathArg);
+
+    // 6. UPLOAD
+    request.log.info(`[${jobId}] Upload para S3...`);
     const fileBuffer = fs.readFileSync(outputPath);
 
     await s3Client.send(new PutObjectCommand({
@@ -223,6 +276,8 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
     }));
 
     const publicUrl = getPublicUrl(finalFileName);
+    request.log.info(`[${jobId}] Concluído: ${publicUrl}`);
+    
     return { success: true, url: publicUrl };
 
   } catch (err) {
@@ -232,9 +287,9 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', { schema: processSche
     return { success: false, error: error.message };
   } finally {
     try {
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-        if (fs.existsSync(subtitlePath)) fs.unlinkSync(subtitlePath);
+      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+      if (fs.existsSync(subtitlePath)) fs.unlinkSync(subtitlePath);
     } catch (e) {}
   }
 });
@@ -243,7 +298,11 @@ const start = async () => {
   try {
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
     await fastify.listen({ port, host: '0.0.0.0' });
-    console.log(`Worker S3 (Buffer Gigante) rodando na porta ${port}`);
-  } catch (err) { fastify.log.error(err); process.exit(1); }
+    console.log(`Worker FFmpeg (Corte Preciso) rodando na porta ${port}`);
+  } catch (err) { 
+    fastify.log.error(err); 
+    process.exit(1); 
+  }
 };
+
 start();
