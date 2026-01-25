@@ -13,7 +13,6 @@ import ffmpegPath from 'ffmpeg-static';
 
 const fastify = Fastify({ 
   logger: true,
-  // Aumenta timeout do servidor para 10 minutos
   connectionTimeout: 600000,
   keepAliveTimeout: 600000
 });
@@ -75,29 +74,77 @@ async function downloadFile(url: string, outputPath: string): Promise<void> {
   await pipeline(Readable.fromWeb(response.body as any), fs.createWriteStream(outputPath));
 }
 
-function formatTimeSRT(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  const ms = Math.round((seconds % 1) * 1000);
-  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`;
-}
-
+// --- GERADOR DE LEGENDAS KARAOKÊ (.ASS) ---
+// Substitui a antiga função SRT para dar o visual "Opus Clip"
 function generateSubtitleFile(words: Word[], cutStartTime: number, outputPath: string): void {
-  let srtContent = '';
+  const ASS_HEADER = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
 
-  words.forEach((w, index) => {
-    const relStart = w.start - cutStartTime;
-    const relEnd = w.end - cutStartTime;
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial Black,85,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,10,10,250,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+  let assContent = ASS_HEADER;
+  let currentGroup: Word[] = [];
+  let currentCharCount = 0;
+
+  const flushGroup = () => {
+    if (currentGroup.length === 0) return;
+
+    const firstWord = currentGroup[0];
+    const lastWord = currentGroup[currentGroup.length - 1];
+
+    const startSeconds = Math.max(0, firstWord.start - cutStartTime);
+    const endSeconds = Math.max(0, lastWord.end - cutStartTime);
+
+    const formatASS = (s: number) => {
+        const date = new Date(0);
+        date.setMilliseconds(s * 1000);
+        return date.toISOString().substr(11, 10).replace('.', '.');
+    };
+
+    let karaokeText = '';
     
-    if (relStart < 0 || relEnd < 0) return;
+    currentGroup.forEach((w, i) => {
+        // Duração em centisegundos para o efeito de pintura (\k)
+        const duration = Math.round((w.end - w.start) * 100);
+        const space = i > 0 ? ' ' : '';
+        // Palavra em MAIÚSCULO
+        karaokeText += `${space}{\\k${duration}}${w.word.toUpperCase()}`; 
+    });
 
-    srtContent += `${index + 1}\n`;
-    srtContent += `${formatTimeSRT(relStart)} --> ${formatTimeSRT(relEnd)}\n`;
-    srtContent += `${w.word}\n\n`;
-  });
-  
-  fs.writeFileSync(outputPath, srtContent);
+    assContent += `Dialogue: 0,${formatASS(startSeconds)},${formatASS(endSeconds)},Default,,0,0,0,,${karaokeText}\n`;
+    
+    currentGroup = [];
+    currentCharCount = 0;
+  };
+
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    
+    // Ignora palavras fora do corte
+    if (w.end < cutStartTime) continue;
+
+    const prevWord = words[i-1];
+    const isBigGap = prevWord && (w.start - prevWord.end > 0.5);
+
+    // Agrupa palavras (max 25 chars ou quebra por pausa)
+    if ((currentCharCount + w.word.length > 25) || isBigGap) {
+        flushGroup();
+    }
+
+    currentGroup.push(w);
+    currentCharCount += w.word.length + 1;
+  }
+  flushGroup();
+
+  fs.writeFileSync(outputPath, assContent);
 }
 
 function runFFmpeg(
@@ -112,95 +159,68 @@ function runFFmpeg(
     const duration = endTime - startTime;
     
     // === FILTRO DE VÍDEO ===
-    // 1. Escala para 1080p de altura (mantém aspect ratio) - MUITO mais rápido
-    // 2. Crop para 9:16 vertical
-    // 3. Aplica legendas se existirem
+    // Crop 9:16
     let videoFilter = 'scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1';
     
     if (subtitlePath && fs.existsSync(subtitlePath)) {
+      // Ajuste para .ASS: Caminho escapado + Filtro 'subtitles' sem force_style
+      // (O estilo agora vem de dentro do arquivo .ass)
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
-      const style = "Fontname=Arial Bold,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=1,MarginV=60,Alignment=2";
-      videoFilter += `,subtitles='${escapedPath}':force_style='${style}'`;
+      videoFilter += `,subtitles='${escapedPath}'`;
     }
 
-    // Fade de áudio suave
     const fadeOutStart = Math.max(0, duration - 0.15);
     const audioFilter = `afade=t=in:st=0:d=0.08,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
     const args = [
       '-y',
-      // Seek ANTES de abrir o input (muito mais rápido para arquivos grandes)
       '-ss', startTime.toFixed(3),
       '-i', inputPath,
       '-t', duration.toFixed(3),
-      // Mapeia streams
       '-map', '0:v:0',
       '-map', '0:a:0?',
-      // Filtros
       '-vf', videoFilter,
       '-af', audioFilter,
-      // Codec de vídeo - preset mais rápido
       '-c:v', 'libx264',
-      '-preset', 'veryfast',  // Mais rápido que 'fast'
+      '-preset', 'veryfast',
       '-crf', '23',
       '-pix_fmt', 'yuv420p',
-      // Codec de áudio
       '-c:a', 'aac',
-      '-b:a', '128k',  // Reduzido de 192k
-      // Otimizações
+      '-b:a', '128k',
       '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart',
-      // Limita threads para não sobrecarregar
       '-threads', '4',
       outputPath
     ];
 
-    logger.info(`[FFmpeg] Iniciando: ${startTime.toFixed(2)}s -> ${endTime.toFixed(2)}s (${duration.toFixed(1)}s)`);
+    logger.info(`[FFmpeg] Iniciando: ${startTime.toFixed(2)}s -> ${endTime.toFixed(2)}s`);
     logger.info(`[FFmpeg] Comando: ffmpeg ${args.join(' ')}`);
     
-    const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args, {
-      // Timeout de 5 minutos para o processo
-      timeout: 300000
-    });
+    const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args, { timeout: 300000 });
 
     let stderrData = '';
-    let lastProgress = '';
     
     ffmpeg.stderr.on('data', (data) => {
-      const chunk = data.toString();
-      stderrData += chunk;
-      
-      // Log de progresso a cada update significativo
-      const timeMatch = chunk.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
-      if (timeMatch && timeMatch[1] !== lastProgress) {
-        lastProgress = timeMatch[1];
-        logger.info(`[FFmpeg] Progresso: ${lastProgress}`);
-      }
+      stderrData += data.toString();
     });
 
     ffmpeg.on('close', (code) => {
       if (code === 0) {
-        logger.info('[FFmpeg] Concluído com sucesso');
+        logger.info('[FFmpeg] Concluído');
         resolve();
       } else {
-        // Pega apenas as últimas 500 chars do erro para não poluir
         const errorTail = stderrData.slice(-500);
         reject(new Error(`FFmpeg exit code ${code}: ${errorTail}`));
       }
     });
 
-    ffmpeg.on('error', (err) => {
-      reject(new Error(`FFmpeg spawn error: ${err.message}`));
-    });
+    ffmpeg.on('error', (err) => reject(new Error(`FFmpeg spawn error: ${err.message}`)));
   });
 }
 
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', { 
   schema: processSchema,
-  config: {
-    // Timeout de 5 minutos para a request
-    requestTimeout: 300000
-  }
+  config: { requestTimeout: 300000 }
 }, async (request, reply) => {
   const { videoUrl, startTime, endTime, jobId, words } = request.body;
   
@@ -209,58 +229,37 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   
   const inputPath = path.join(tempDir, `input_${executionId}.mp4`);
   const outputPath = path.join(tempDir, `output_${executionId}.mp4`);
-  const subtitlePath = path.join(tempDir, `sub_${executionId}.srt`);
+  // Mudança de extensão para .ass
+  const subtitlePath = path.join(tempDir, `sub_${executionId}.ass`);
   
   const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
   const duration = endTime - startTime;
 
   try {
-    request.log.info(`[${jobId}] ▶ Novo corte: ${startTime.toFixed(2)}s -> ${endTime.toFixed(2)}s (${duration.toFixed(1)}s)`);
-    request.log.info(`[${jobId}] Palavras: ${words?.length || 0}`);
+    request.log.info(`[${jobId}] ▶ Novo corte: ${duration.toFixed(1)}s`);
     
-    // 1. Download
-    request.log.info(`[${jobId}] Baixando vídeo...`);
-    const downloadStart = Date.now();
     await downloadFile(videoUrl, inputPath);
-    request.log.info(`[${jobId}] Download: ${((Date.now() - downloadStart) / 1000).toFixed(1)}s`);
 
-    // 2. Gera legenda se tiver palavras
     let subPathArg: string | undefined;
     if (words && words.length > 0) {
+      // Ajuste de delay de áudio (opcional, mantendo padrão)
       generateSubtitleFile(words, startTime, subtitlePath);
       subPathArg = subtitlePath;
     }
 
-    // 3. Corta o vídeo
-    request.log.info(`[${jobId}] Processando com FFmpeg...`);
-    const ffmpegStart = Date.now();
     await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, request.log);
-    request.log.info(`[${jobId}] FFmpeg: ${((Date.now() - ffmpegStart) / 1000).toFixed(1)}s`);
 
-    // Verifica se o arquivo foi criado
-    if (!fs.existsSync(outputPath)) {
-      throw new Error('Arquivo de saída não foi criado');
-    }
+    if (!fs.existsSync(outputPath)) throw new Error('Arquivo de saída não criado');
 
-    const outputStats = fs.statSync(outputPath);
-    request.log.info(`[${jobId}] Arquivo gerado: ${(outputStats.size / 1024 / 1024).toFixed(2)} MB`);
-
-    // 4. Upload
-    request.log.info(`[${jobId}] Upload para S3...`);
-    const uploadStart = Date.now();
     const fileBuffer = fs.readFileSync(outputPath);
-
     await s3Client.send(new PutObjectCommand({
       Bucket: S3_BUCKET_NAME,
       Key: finalFileName,
       Body: fileBuffer,
       ContentType: 'video/mp4'
     }));
-    request.log.info(`[${jobId}] Upload: ${((Date.now() - uploadStart) / 1000).toFixed(1)}s`);
 
     const publicUrl = getPublicUrl(finalFileName);
-    request.log.info(`[${jobId}] ✓ Concluído: ${publicUrl}`);
-    
     return { success: true, url: publicUrl };
 
   } catch (err) {
@@ -269,7 +268,6 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
     reply.code(500);
     return { success: false, error: error.message };
   } finally {
-    // Cleanup
     [inputPath, outputPath, subtitlePath].forEach(p => {
       try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
     });
