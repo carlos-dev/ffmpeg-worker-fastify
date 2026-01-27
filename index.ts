@@ -118,11 +118,11 @@ async function downloadFile(
     downloaded += value.length;
     fileStream.write(value);
 
-    // Progresso do Download (0 a 10%) do progresso total
+    // Retorna percentual bruto (0-100), o caller faz o mapeamento
     if (totalLength) {
-      const percent = (downloaded / totalLength) * 10;
-      // Throttle: só notifica a cada 2% para economizar rede
-      if (percent - lastReport > 2) {
+      const percent = (downloaded / totalLength) * 100;
+      // Throttle: só notifica a cada 10% para download rápido do R2
+      if (percent - lastReport > 10) {
         onProgress(percent);
         lastReport = percent;
       }
@@ -224,15 +224,13 @@ function runFFmpeg(
       const timeMatch = chunk.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
       if (timeMatch) {
         const currentTime = timeToSeconds(timeMatch[1]);
-        let percent = (currentTime / duration) * 100;
-
-        // FFmpeg vai de 10% a 90% do progresso total
-        const globalPercent = 10 + (percent * 0.8);
+        // Retorna percentual bruto (0-100), o caller faz o mapeamento
+        const percent = Math.min(100, (currentTime / duration) * 100);
 
         // Throttle: só notifica a cada 5% para economizar rede
-        if (globalPercent - lastReport > 5) {
-          onProgress(Math.min(90, globalPercent));
-          lastReport = globalPercent;
+        if (percent - lastReport > 5) {
+          onProgress(percent);
+          lastReport = percent;
         }
       }
     });
@@ -258,13 +256,22 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   const subtitlePath = path.join(tempDir, `sub_${executionId}.ass`);
   const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
 
-  try {
-    // Notifica o backend que começou
-    notifyBackend(jobId, { status: 'starting', progress: 0, message: 'Worker iniciado' });
+  // Nova escala de progresso:
+  // n8n: 0% → 50% (transcrição, GPT, seleção de cortes)
+  // Worker: 50% → 100% (download R2, renderização, upload)
+  //   - Download R2: 50% → 55% (rápido)
+  //   - Renderização: 55% → 95%
+  //   - Upload: 95% → 100%
 
-    // 1. Download (0% a 10%)
+  try {
+    // Notifica o backend que o Worker começou (50%)
+    notifyBackend(jobId, { status: 'rendering', progress: 50, message: 'Worker iniciado' });
+
+    // 1. Download do R2 (50% → 55%) - rápido pois é do próprio cloud
     await downloadFile(videoUrl, inputPath, (pct) => {
-      notifyBackend(jobId, { status: 'downloading', progress: Math.floor(pct) });
+      // pct vai de 0 a 100, mapeia para 50 a 55
+      const globalPct = 50 + (pct / 100) * 5;
+      notifyBackend(jobId, { status: 'downloading', progress: Math.floor(globalPct) });
     });
 
     // 2. Legendas
@@ -274,12 +281,14 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
       subPathArg = subtitlePath;
     }
 
-    // 3. Renderização (10% a 90%)
+    // 3. Renderização (55% → 95%)
     await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, (pct) => {
-      notifyBackend(jobId, { status: 'rendering', progress: Math.floor(pct) });
+      // pct vai de 0 a 100, mapeia para 55 a 95
+      const globalPct = 55 + (pct / 100) * 40;
+      notifyBackend(jobId, { status: 'rendering', progress: Math.floor(globalPct) });
     }, request.log);
 
-    // 4. Upload (90% a 100%)
+    // 4. Upload (95% → 100%)
     notifyBackend(jobId, { status: 'uploading', progress: 95 });
 
     const fileBuffer = fs.readFileSync(outputPath);
