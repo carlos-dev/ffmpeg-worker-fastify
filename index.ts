@@ -128,7 +128,13 @@ async function downloadFile(
       }
     }
   }
-  fileStream.end();
+
+  // Aguarda o arquivo ser completamente gravado no disco antes de retornar
+  await new Promise<void>((resolve, reject) => {
+    fileStream.on('finish', resolve);
+    fileStream.on('error', reject);
+    fileStream.end();
+  });
 }
 
 function generateSubtitleFile(words: Word[], cutStartTime: number, outputPath: string): void {
