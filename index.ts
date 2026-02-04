@@ -208,8 +208,8 @@ function runFFmpeg(
       '-y', '-ss', startTime.toFixed(3), '-i', inputPath, '-t', duration.toFixed(3),
       '-map', '0:v:0', '-map', '0:a:0?',
       '-vf', videoFilter, '-af', audioFilter,
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac', '-b:a', '128k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart',
+      '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-profile:v', 'high', '-level', '4.2', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '192k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart',
       '-threads', '4', outputPath
     ];
 
