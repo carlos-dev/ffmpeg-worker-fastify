@@ -3,11 +3,16 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { randomUUID } from 'crypto';
 import ffmpegPath from 'ffmpeg-static';
+
+// __dirname equivalente para ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const fastify = Fastify({
   logger: true,
@@ -77,6 +82,7 @@ interface ProcessVideoBody {
   endTime: number;
   jobId: string;
   words: Word[];
+  shouldWatermark?: boolean;
 }
 
 const processSchema = {
@@ -88,10 +94,18 @@ const processSchema = {
       startTime: { type: 'number' },
       endTime: { type: 'number' },
       jobId: { type: 'string' },
-      words: { type: 'array' }
+      words: { type: 'array' },
+      shouldWatermark: { type: 'boolean' }
     }
   }
 };
+
+// Caminho absoluto para o asset de watermark
+// Em dev: __dirname é a raiz do projeto
+// Em prod: __dirname é dist/, então precisamos subir um nível
+const WATERMARK_PATH = fs.existsSync(path.resolve(__dirname, 'assets', 'watermark.png'))
+  ? path.resolve(__dirname, 'assets', 'watermark.png')
+  : path.resolve(__dirname, '..', 'assets', 'watermark.png');
 
 async function downloadFile(
   url: string,
@@ -195,29 +209,60 @@ function runFFmpeg(
   startTime: number,
   endTime: number,
   subtitlePath: string | undefined,
+  watermarkPath: string | undefined,
   onProgress: (pct: number) => void,
   logger: any
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const duration = endTime - startTime;
-    let videoFilter = 'scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1';
-
-    if (subtitlePath && fs.existsSync(subtitlePath)) {
-      const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
-      videoFilter += `,subtitles='${escapedPath}'`;
-    }
-
     const fadeOutStart = Math.max(0, duration - 0.15);
     const audioFilter = `afade=t=in:st=0:d=0.08,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
-    const args = [
-      '-y', '-ss', startTime.toFixed(3), '-i', inputPath, '-t', duration.toFixed(3),
-      '-map', '0:v:0', '-map', '0:a:0?',
-      '-vf', videoFilter, '-af', audioFilter,
-      '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-profile:v', 'high', '-level', '4.2', '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac', '-b:a', '192k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart',
-      '-threads', '4', outputPath
-    ];
+    let args: string[];
+
+    // Se tiver watermark, usa filter_complex para combinar vídeo + marca d'água
+    if (watermarkPath && fs.existsSync(watermarkPath)) {
+      // Constrói o filtro base para o vídeo
+      let videoFilter = 'scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1';
+
+      if (subtitlePath && fs.existsSync(subtitlePath)) {
+        const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
+        videoFilter += `,subtitles='${escapedPath}'`;
+      }
+
+      // filter_complex: processa vídeo, redimensiona watermark e faz overlay
+      // Watermark: 80px de largura, 20px de margem do canto inferior direito, 50% de opacidade
+      const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-1,format=rgba,colorchannelmixer=aa=0.5[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
+
+      args = [
+        '-y', '-ss', startTime.toFixed(3), '-i', inputPath, '-i', watermarkPath, '-t', duration.toFixed(3),
+        '-filter_complex', filterComplex,
+        '-map', '[outv]', '-map', '0:a:0?',
+        '-af', audioFilter,
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-profile:v', 'high', '-level', '4.2', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '192k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart',
+        '-threads', '4', outputPath
+      ];
+
+      logger.info(`FFmpeg com watermark: ${watermarkPath}`);
+    } else {
+      // Sem watermark - usa -vf simples (mais eficiente)
+      let videoFilter = 'scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1';
+
+      if (subtitlePath && fs.existsSync(subtitlePath)) {
+        const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
+        videoFilter += `,subtitles='${escapedPath}'`;
+      }
+
+      args = [
+        '-y', '-ss', startTime.toFixed(3), '-i', inputPath, '-t', duration.toFixed(3),
+        '-map', '0:v:0', '-map', '0:a:0?',
+        '-vf', videoFilter, '-af', audioFilter,
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-profile:v', 'high', '-level', '4.2', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '192k', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart',
+        '-threads', '4', outputPath
+      ];
+    }
 
     const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args, { timeout: 300000 });
     let stderrData = '';
@@ -253,7 +298,7 @@ function runFFmpeg(
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   schema: processSchema
 }, async (request, reply) => {
-  const { videoUrl, startTime, endTime, jobId, words } = request.body;
+  const { videoUrl, startTime, endTime, jobId, words, shouldWatermark } = request.body;
 
   const tempDir = os.tmpdir();
   const executionId = randomUUID();
@@ -261,6 +306,12 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   const outputPath = path.join(tempDir, `output_${executionId}.mp4`);
   const subtitlePath = path.join(tempDir, `sub_${executionId}.ass`);
   const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
+
+  // Determina se deve aplicar watermark
+  const watermarkPathArg = shouldWatermark && fs.existsSync(WATERMARK_PATH) ? WATERMARK_PATH : undefined;
+  if (shouldWatermark) {
+    request.log.info(`Watermark solicitado. Caminho: ${WATERMARK_PATH}, Existe: ${fs.existsSync(WATERMARK_PATH)}`);
+  }
 
   // Nova escala de progresso:
   // n8n: 0% → 50% (transcrição, GPT, seleção de cortes)
@@ -288,7 +339,7 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
     }
 
     // 3. Renderização (55% → 95%)
-    await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, (pct) => {
+    await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, watermarkPathArg, (pct) => {
       // pct vai de 0 a 100, mapeia para 55 a 95
       const globalPct = 55 + (pct / 100) * 40;
       notifyBackend(jobId, { status: 'rendering', progress: Math.floor(globalPct) });
