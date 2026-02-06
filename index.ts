@@ -231,8 +231,9 @@ function runFFmpeg(
       }
 
       // filter_complex: processa vídeo, redimensiona watermark e faz overlay
+      // Ref: https://www.mux.com/articles/add-watermarks-to-a-video-with-ffmpeg
       // Watermark: 80px de largura, 20px de margem do canto inferior direito, 50% de opacidade
-      const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-1,format=rgba,colorchannelmixer=aa=0.5[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
+      const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-2[wm];[video][wm]overlay=main_w-overlay_w-20:main_h-overlay_h-20:alpha=0.5[outv]`;
 
       args = [
         '-y', '-ss', startTime.toFixed(3), '-i', inputPath, '-i', watermarkPath, '-t', duration.toFixed(3),
@@ -308,10 +309,11 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
 
   // Determina se deve aplicar watermark
+  request.log.info(`shouldWatermark recebido: ${shouldWatermark} (tipo: ${typeof shouldWatermark})`);
+  request.log.info(`WATERMARK_PATH: ${WATERMARK_PATH}, Existe: ${fs.existsSync(WATERMARK_PATH)}`);
   const watermarkPathArg = shouldWatermark && fs.existsSync(WATERMARK_PATH) ? WATERMARK_PATH : undefined;
-  if (shouldWatermark) {
-    request.log.info(`Watermark solicitado. Caminho: ${WATERMARK_PATH}, Existe: ${fs.existsSync(WATERMARK_PATH)}`);
-  }
+  request.log.info(`watermarkPathArg final: ${watermarkPathArg || 'NENHUM (sem watermark)'}`);
+
 
   // Nova escala de progresso:
   // n8n: 0% → 50% (transcrição, GPT, seleção de cortes)
