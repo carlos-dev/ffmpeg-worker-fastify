@@ -248,10 +248,9 @@ function runFFmpeg(
       }
 
       // filter_complex: processa vídeo, redimensiona watermark e faz overlay
-      // Watermark: 80px de largura, 20px de margem do canto inferior direito, 50% de opacidade
-      // Usa scale=80:-2 para garantir dimensões pares, format=rgba antes de colorchannelmixer
-      // W/H = dimensões do vídeo principal, w/h = dimensões do overlay
-      const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-2,format=rgba,colorchannelmixer=aa=0.5[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
+      // Watermark: 80px de largura, 20px de margem do canto inferior direito
+      // DEBUG: sem colorchannelmixer para testar se overlay funciona no FFmpeg 7.x
+      const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-2[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
 
       args = [
         '-y', '-ss', startTime.toFixed(3), '-i', inputPath, '-i', watermarkPath, '-t', duration.toFixed(3),
@@ -309,8 +308,9 @@ function runFFmpeg(
 
     ffmpeg.on('close', (code) => {
       if (code === 0) {
-        // Log stream info e warnings (primeiras linhas do stderr contêm infos úteis)
-        logger.info(`FFmpeg concluído com sucesso. Stderr (últimos 800 chars): ${stderrData.slice(-800)}`);
+        // Log stream info (início) e encoding stats (final)
+        logger.info(`FFmpeg stderr INÍCIO (1500 chars): ${stderrData.slice(0, 1500)}`);
+        logger.info(`FFmpeg stderr FIM (800 chars): ${stderrData.slice(-800)}`);
         resolve();
       } else {
         logger.error(`FFmpeg falhou (code ${code}). Stderr completo: ${stderrData}`);
@@ -443,8 +443,8 @@ fastify.get('/test-watermark', async (request, reply) => {
       gen.on('error', reject);
     });
 
-    // 4. Overlay watermark (mesmo filter_complex do worker)
-    const filterComplex = `[0:v]scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1[video];[1:v]scale=80:-2,format=rgba,colorchannelmixer=aa=0.5[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
+    // 4. Overlay watermark (mesmo filter_complex do worker - sem colorchannelmixer para debug)
+    const filterComplex = `[0:v]scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1[video];[1:v]scale=80:-2[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
     let overlayStderr = '';
     await new Promise<void>((resolve, reject) => {
       const proc = spawn(ffmpegPath || 'ffmpeg', [
