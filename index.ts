@@ -253,7 +253,9 @@ function runFFmpeg(
       const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-2[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
 
       args = [
-        '-y', '-ss', startTime.toFixed(3), '-i', inputPath, '-i', watermarkPath, '-t', duration.toFixed(3),
+        '-y', '-ss', startTime.toFixed(3), '-i', inputPath,
+        '-loop', '1', '-i', watermarkPath,
+        '-t', duration.toFixed(3),
         '-filter_complex', filterComplex,
         '-map', '[outv]', '-map', '0:a:0?',
         '-af', audioFilter,
@@ -308,9 +310,13 @@ function runFFmpeg(
 
     ffmpeg.on('close', (code) => {
       if (code === 0) {
-        // Log stream info (início) e encoding stats (final)
-        logger.info(`FFmpeg stderr INÍCIO (1500 chars): ${stderrData.slice(0, 1500)}`);
-        logger.info(`FFmpeg stderr FIM (800 chars): ${stderrData.slice(-800)}`);
+        // Log diagnóstico direcionado
+        const hasInput1 = stderrData.includes('Input #1');
+        const streamMapping = stderrData.match(/Stream mapping[\s\S]*?(?=frame|Output|$)/)?.[0]?.trim() || 'NOT FOUND';
+        const outputInfo = stderrData.match(/Output #0[\s\S]*?(?=frame|Stream mapping|$)/)?.[0]?.slice(0, 500) || 'NOT FOUND';
+        logger.info(`FFmpeg Input #1 detectado: ${hasInput1}`);
+        logger.info(`FFmpeg Stream mapping: ${streamMapping.slice(0, 500)}`);
+        logger.info(`FFmpeg Output: ${outputInfo}`);
         resolve();
       } else {
         logger.error(`FFmpeg falhou (code ${code}). Stderr completo: ${stderrData}`);
