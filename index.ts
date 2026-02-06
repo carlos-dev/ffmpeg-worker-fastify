@@ -60,6 +60,23 @@ async function notifyBackend(jobId: string, payload: object) {
   }
 }
 
+// --- DIAGNÓSTICO FFMPEG ---
+function getFFmpegVersion(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath || 'ffmpeg', ['-version']);
+    let stdout = '';
+    proc.stdout.on('data', (d: Buffer) => stdout += d.toString());
+    proc.on('close', (code: number | null) => {
+      if (code === 0) {
+        resolve((stdout.split('\n')[0] || stdout).trim());
+      } else {
+        reject(new Error('Failed to get FFmpeg version'));
+      }
+    });
+    proc.on('error', reject);
+  });
+}
+
 // --- UTILITÁRIOS DE TEMPO ---
 function timeToSeconds(timeString: string): number {
   const parts = timeString.split(':');
@@ -231,9 +248,10 @@ function runFFmpeg(
       }
 
       // filter_complex: processa vídeo, redimensiona watermark e faz overlay
-      // Ref: https://www.mux.com/articles/add-watermarks-to-a-video-with-ffmpeg
       // Watermark: 80px de largura, 20px de margem do canto inferior direito, 50% de opacidade
-      const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-2[wm];[video][wm]overlay=main_w-overlay_w-20:main_h-overlay_h-20:alpha=0.5[outv]`;
+      // Usa scale=80:-2 para garantir dimensões pares, format=rgba antes de colorchannelmixer
+      // W/H = dimensões do vídeo principal, w/h = dimensões do overlay
+      const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-2,format=rgba,colorchannelmixer=aa=0.5[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
 
       args = [
         '-y', '-ss', startTime.toFixed(3), '-i', inputPath, '-i', watermarkPath, '-t', duration.toFixed(3),
@@ -246,6 +264,8 @@ function runFFmpeg(
       ];
 
       logger.info(`FFmpeg com watermark: ${watermarkPath}`);
+      logger.info(`filter_complex: ${filterComplex}`);
+      logger.info(`FFmpeg args: ${JSON.stringify(args)}`);
     } else {
       // Sem watermark - usa -vf simples (mais eficiente)
       let videoFilter = 'scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1';
@@ -288,8 +308,14 @@ function runFFmpeg(
     });
 
     ffmpeg.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`FFmpeg error: ${stderrData.slice(-500)}`));
+      if (code === 0) {
+        // Log stream info e warnings (primeiras linhas do stderr contêm infos úteis)
+        logger.info(`FFmpeg concluído com sucesso. Stderr (últimos 800 chars): ${stderrData.slice(-800)}`);
+        resolve();
+      } else {
+        logger.error(`FFmpeg falhou (code ${code}). Stderr completo: ${stderrData}`);
+        reject(new Error(`FFmpeg error (code ${code}): ${stderrData.slice(-500)}`));
+      }
     });
     ffmpeg.on('error', (err) => reject(new Error(`FFmpeg spawn error: ${err.message}`)));
   });
@@ -384,9 +410,99 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   }
 });
 
+// --- DIAGNÓSTICO: Testa watermark overlay no ambiente atual ---
+fastify.get('/test-watermark', async (request, reply) => {
+  const tempDir = os.tmpdir();
+  const testId = randomUUID().slice(0, 8);
+  const testInput = path.join(tempDir, `wm_test_in_${testId}.mp4`);
+  const testOutput = path.join(tempDir, `wm_test_out_${testId}.mp4`);
+
+  try {
+    // 1. FFmpeg version
+    const version = await getFFmpegVersion();
+
+    // 2. Watermark file info
+    const wmExists = fs.existsSync(WATERMARK_PATH);
+    const wmSize = wmExists ? fs.statSync(WATERMARK_PATH).size : 0;
+
+    if (!wmExists) {
+      return { success: false, error: 'Watermark file not found', path: WATERMARK_PATH };
+    }
+
+    // 3. Gera vídeo de teste 1s (cor sólida 1920x1080)
+    let genStderr = '';
+    await new Promise<void>((resolve, reject) => {
+      const gen = spawn(ffmpegPath || 'ffmpeg', [
+        '-y', '-f', 'lavfi', '-i', 'color=c=darkgreen:size=1920x1080:d=1',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-t', '1', testInput
+      ]);
+      gen.stderr.on('data', (d: Buffer) => genStderr += d.toString());
+      gen.on('close', (code: number | null) =>
+        code === 0 ? resolve() : reject(new Error(`Gen failed (${code}): ${genStderr.slice(-300)}`))
+      );
+      gen.on('error', reject);
+    });
+
+    // 4. Overlay watermark (mesmo filter_complex do worker)
+    const filterComplex = `[0:v]scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1[video];[1:v]scale=80:-2,format=rgba,colorchannelmixer=aa=0.5[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
+    let overlayStderr = '';
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn(ffmpegPath || 'ffmpeg', [
+        '-y', '-i', testInput, '-i', WATERMARK_PATH, '-t', '1',
+        '-filter_complex', filterComplex,
+        '-map', '[outv]',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+        testOutput
+      ]);
+      proc.stderr.on('data', (d: Buffer) => overlayStderr += d.toString());
+      proc.on('close', (code: number | null) =>
+        code === 0 ? resolve() : reject(new Error(`Overlay failed (${code}): ${overlayStderr.slice(-500)}`))
+      );
+      proc.on('error', reject);
+    });
+
+    // 5. Resultado
+    const outputExists = fs.existsSync(testOutput);
+    const outputSize = outputExists ? fs.statSync(testOutput).size : 0;
+
+    return {
+      success: true,
+      ffmpegVersion: version,
+      ffmpegBinary: ffmpegPath,
+      watermark: { path: WATERMARK_PATH, exists: wmExists, sizeBytes: wmSize },
+      output: { exists: outputExists, sizeBytes: outputSize },
+      filterComplex,
+      overlayStderr: overlayStderr.slice(-1500)
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: (err as Error).message,
+      watermark: { path: WATERMARK_PATH, exists: fs.existsSync(WATERMARK_PATH), sizeBytes: fs.existsSync(WATERMARK_PATH) ? fs.statSync(WATERMARK_PATH).size : 0 }
+    };
+  } finally {
+    [testInput, testOutput].forEach(p => {
+      try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+    });
+  }
+});
+
 fastify.get('/health', async () => ({ status: 'ok' }));
 
 const start = async () => {
+  // Startup diagnostics
+  try {
+    const version = await getFFmpegVersion();
+    console.log(`[Startup] FFmpeg: ${version}`);
+    console.log(`[Startup] FFmpeg binary: ${ffmpegPath}`);
+  } catch (e) {
+    console.error(`[Startup] FFmpeg não encontrado: ${(e as Error).message}`);
+  }
+
+  const wmExists = fs.existsSync(WATERMARK_PATH);
+  const wmSize = wmExists ? fs.statSync(WATERMARK_PATH).size : 0;
+  console.log(`[Startup] Watermark: ${WATERMARK_PATH} | Existe: ${wmExists} | Tamanho: ${wmSize} bytes`);
+
   const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
   await fastify.listen({ port, host: '0.0.0.0' });
   console.log(`Worker rodando na porta ${port}`);
