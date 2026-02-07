@@ -124,6 +124,40 @@ const WATERMARK_PATH = fs.existsSync(path.resolve(__dirname, 'assets', 'watermar
   ? path.resolve(__dirname, 'assets', 'watermark.png')
   : path.resolve(__dirname, '..', 'assets', 'watermark.png');
 
+// Watermark pré-escalado (criado no startup para evitar reprocessar o PNG de 6MB a cada frame)
+const WATERMARK_SCALED_PATH = path.join(os.tmpdir(), 'watermark_80.png');
+
+async function prepareWatermark(): Promise<boolean> {
+  if (!fs.existsSync(WATERMARK_PATH)) {
+    console.error('[Startup] Watermark original não encontrado');
+    return false;
+  }
+
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegPath || 'ffmpeg', [
+      '-y', '-i', WATERMARK_PATH,
+      '-vf', 'scale=80:-2',
+      WATERMARK_SCALED_PATH
+    ]);
+    let stderr = '';
+    proc.stderr.on('data', (d: Buffer) => stderr += d.toString());
+    proc.on('close', (code: number | null) => {
+      if (code === 0 && fs.existsSync(WATERMARK_SCALED_PATH)) {
+        const size = fs.statSync(WATERMARK_SCALED_PATH).size;
+        console.log(`[Startup] Watermark pré-escalado: ${WATERMARK_SCALED_PATH} (${size} bytes)`);
+        resolve(true);
+      } else {
+        console.error(`[Startup] Falha ao pré-escalar watermark: ${stderr.slice(-300)}`);
+        resolve(false);
+      }
+    });
+    proc.on('error', (err) => {
+      console.error(`[Startup] Erro ao pré-escalar: ${err.message}`);
+      resolve(false);
+    });
+  });
+}
+
 async function downloadFile(
   url: string,
   outputPath: string,
@@ -247,14 +281,17 @@ function runFFmpeg(
         videoFilter += `,subtitles='${escapedPath}'`;
       }
 
-      // filter_complex: processa vídeo, redimensiona watermark e faz overlay
-      // Watermark: 80px de largura, 20px de margem do canto inferior direito
-      // DEBUG: sem colorchannelmixer para testar se overlay funciona no FFmpeg 7.x
-      const filterComplex = `[0:v]${videoFilter}[video];[1:v]scale=80:-2[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
+      // filter_complex: processa vídeo e faz overlay com watermark pré-escalado
+      // Watermark já está em 80px (pré-escalado no startup), aplica 50% opacidade
+      // eof_action=repeat: repete o último frame do watermark por toda a duração
+      const wmPath = fs.existsSync(WATERMARK_SCALED_PATH) ? WATERMARK_SCALED_PATH : watermarkPath;
+      const wmNeedsScale = wmPath !== WATERMARK_SCALED_PATH;
+      const wmFilter = wmNeedsScale ? 'scale=80:-2,format=rgba,colorchannelmixer=aa=0.5' : 'format=rgba,colorchannelmixer=aa=0.5';
+      const filterComplex = `[0:v]${videoFilter}[video];[1:v]${wmFilter}[wm];[video][wm]overlay=W-w-20:H-h-20:eof_action=repeat[outv]`;
 
       args = [
         '-y', '-ss', startTime.toFixed(3), '-i', inputPath,
-        '-loop', '1', '-i', watermarkPath,
+        '-i', wmPath,
         '-t', duration.toFixed(3),
         '-filter_complex', filterComplex,
         '-map', '[outv]', '-map', '0:a:0?',
@@ -449,12 +486,15 @@ fastify.get('/test-watermark', async (request, reply) => {
       gen.on('error', reject);
     });
 
-    // 4. Overlay watermark (mesmo filter_complex do worker - sem colorchannelmixer para debug)
-    const filterComplex = `[0:v]scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1[video];[1:v]scale=80:-2[wm];[video][wm]overlay=W-w-20:H-h-20[outv]`;
+    // 4. Overlay watermark (mesmo filter_complex do worker - usa pré-escalado se disponível)
+    const wmTestPath = fs.existsSync(WATERMARK_SCALED_PATH) ? WATERMARK_SCALED_PATH : WATERMARK_PATH;
+    const wmTestNeedsScale = wmTestPath !== WATERMARK_SCALED_PATH;
+    const wmTestFilter = wmTestNeedsScale ? 'scale=80:-2,format=rgba,colorchannelmixer=aa=0.5' : 'format=rgba,colorchannelmixer=aa=0.5';
+    const filterComplex = `[0:v]scale=-2:1080,crop=trunc(ih*9/16/2)*2:ih:(iw-ow)/2:0,setsar=1[video];[1:v]${wmTestFilter}[wm];[video][wm]overlay=W-w-20:H-h-20:eof_action=repeat[outv]`;
     let overlayStderr = '';
     await new Promise<void>((resolve, reject) => {
       const proc = spawn(ffmpegPath || 'ffmpeg', [
-        '-y', '-i', testInput, '-i', WATERMARK_PATH, '-t', '1',
+        '-y', '-i', testInput, '-i', wmTestPath, '-t', '1',
         '-filter_complex', filterComplex,
         '-map', '[outv]',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
@@ -471,11 +511,15 @@ fastify.get('/test-watermark', async (request, reply) => {
     const outputExists = fs.existsSync(testOutput);
     const outputSize = outputExists ? fs.statSync(testOutput).size : 0;
 
+    const scaledExists = fs.existsSync(WATERMARK_SCALED_PATH);
+    const scaledSize = scaledExists ? fs.statSync(WATERMARK_SCALED_PATH).size : 0;
+
     return {
       success: true,
       ffmpegVersion: version,
       ffmpegBinary: ffmpegPath,
       watermark: { path: WATERMARK_PATH, exists: wmExists, sizeBytes: wmSize },
+      watermarkScaled: { path: WATERMARK_SCALED_PATH, exists: scaledExists, sizeBytes: scaledSize, usedInTest: wmTestPath === WATERMARK_SCALED_PATH },
       output: { exists: outputExists, sizeBytes: outputSize },
       filterComplex,
       overlayStderr: overlayStderr.slice(-1500)
@@ -507,7 +551,12 @@ const start = async () => {
 
   const wmExists = fs.existsSync(WATERMARK_PATH);
   const wmSize = wmExists ? fs.statSync(WATERMARK_PATH).size : 0;
-  console.log(`[Startup] Watermark: ${WATERMARK_PATH} | Existe: ${wmExists} | Tamanho: ${wmSize} bytes`);
+  console.log(`[Startup] Watermark original: ${WATERMARK_PATH} | Existe: ${wmExists} | Tamanho: ${wmSize} bytes`);
+
+  // Pré-escala o watermark para 80px (evita reprocessar 6MB a cada frame)
+  if (wmExists) {
+    await prepareWatermark();
+  }
 
   const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
   await fastify.listen({ port, host: '0.0.0.0' });
