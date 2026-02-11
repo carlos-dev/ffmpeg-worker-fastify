@@ -208,8 +208,7 @@ function runFFmpeg(
     const fadeOutStart = Math.max(0, duration - 0.15);
     const audioFilter = `afade=t=in:st=0:d=0.08,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
-    let videoFilter = 'scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1';
-
+    let videoFilter = 'scale=-1:1280:flags=lanczos,crop=720:1280:(iw-720)/2:0,setsar=1';
     // Opcional: Adicionar um filtro de nitidez (unsharp) ajuda a compensar o zoom digital
     videoFilter += ',unsharp=5:5:0.8:5:5:0.8';
 
@@ -223,32 +222,30 @@ function runFFmpeg(
       '-ss', startTime.toFixed(3),
       '-i', inputPath,
       '-t', duration.toFixed(3),
+      
+      // Limita o uso de Threads para não estourar a CPU/RAM do Railway
+      '-threads', '2', 
+    
       '-map', '0:v:0',
       '-map', '0:a:0?',
-      '-vf', videoFilter, // Mantém o filtro de zoom que te passei (scale=-1:1920...)
+      '-vf', videoFilter,
       '-af', audioFilter,
-      
-      // --- OTIMIZAÇÃO DE PERFORMANCE ---
+    
       '-c:v', 'libx264',
       
-      // MUDANÇA CRUCIAL 1: De 'veryslow' para 'veryfast'
-      // 'veryfast' é o padrão da indústria para encoding em tempo real/nuvem.
-      // A diferença visual no celular é imperceptível, mas é 10x mais rápido.
-      '-preset', 'veryfast', 
+      // 'ultrafast': Prioridade total em terminar o job sem travar
+      '-preset', 'ultrafast', 
       
-      // MUDANÇA CRUCIAL 2: CRF 26 (Padrão Web)
-      // CRF 18 gera arquivos gigantes. 23-26 é o ideal para streaming.
-      '-crf', '26',      
+      // CRF 28: Qualidade um pouco menor, mas muito mais leve para processar
+      '-crf', '28',      
       
-      // Limites de Bitrate para TikTok (Evita picos que travam o player)
-      '-maxrate', '4500k', 
-      '-bufsize', '9000k',
+      '-maxrate', '3000k', // 3Mbps é ok para 720p
+      '-bufsize', '6000k',
       
-      '-profile:v', 'main', // 'high' às vezes dá problema em Androids antigos
       '-pix_fmt', 'yuv420p',
       
       '-c:a', 'aac',
-      '-b:a', '128k', // 128k é suficiente para voz/podcast
+      '-b:a', '128k',
       '-ar', '44100',
       
       '-movflags', '+faststart',
