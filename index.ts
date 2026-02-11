@@ -225,30 +225,36 @@ function runFFmpeg(
       '-t', duration.toFixed(3),
       '-map', '0:v:0',
       '-map', '0:a:0?',
-      '-vf', videoFilter,
+      '-vf', videoFilter, // Mantém o filtro de zoom que te passei (scale=-1:1920...)
       '-af', audioFilter,
       
-      // --- CODEC DE VÍDEO (Qualidade Extrema) ---
+      // --- OTIMIZAÇÃO DE PERFORMANCE ---
       '-c:v', 'libx264',
-      '-preset', 'veryslow', // Preset mais lento para melhor compressão e qualidade
-      '-crf', '18',      // 18 é o ideal para Web/TikTok (visualmente sem perdas e tamanho ok)
-      '-maxrate', '12M', // 12Mbps é seguro para TikTok e garante qualidade
-      '-bufsize', '24M', // Buffer ajustado
-      '-profile:v', 'high',
-      '-level', '4.2',
+      
+      // MUDANÇA CRUCIAL 1: De 'veryslow' para 'veryfast'
+      // 'veryfast' é o padrão da indústria para encoding em tempo real/nuvem.
+      // A diferença visual no celular é imperceptível, mas é 10x mais rápido.
+      '-preset', 'veryfast', 
+      
+      // MUDANÇA CRUCIAL 2: CRF 26 (Padrão Web)
+      // CRF 18 gera arquivos gigantes. 23-26 é o ideal para streaming.
+      '-crf', '26',      
+      
+      // Limites de Bitrate para TikTok (Evita picos que travam o player)
+      '-maxrate', '4500k', 
+      '-bufsize', '9000k',
+      
+      '-profile:v', 'main', // 'high' às vezes dá problema em Androids antigos
       '-pix_fmt', 'yuv420p',
       
-      // --- CODEC DE ÁUDIO ---
       '-c:a', 'aac',
-      '-b:a', '192k', // 192k é HD para áudio AAC
-      '-ar', '44100', // Garante compatibilidade
+      '-b:a', '128k', // 128k é suficiente para voz/podcast
+      '-ar', '44100',
       
-      // --- METADATA ---
-      '-movflags', '+faststart', // Vital para web (começa a tocar antes de baixar tudo)
+      '-movflags', '+faststart',
       
       outputPath
     ];
-
     const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args, { timeout: 300000 });
     let stderrData = '';
     let lastReport = 0;
