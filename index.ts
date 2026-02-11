@@ -208,13 +208,7 @@ function runFFmpeg(
     const fadeOutStart = Math.max(0, duration - 0.15);
     const audioFilter = `afade=t=in:st=0:d=0.08,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
-    // Resolução vertical ideal: 1080x1920 (9:16)
-    // Primeiro escala para 1920 de altura (mantendo aspect ratio), depois crop para 1080 de largura
-    let videoFilter = 'scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1';
-
-    // Pré-sharpening LEVE para compensar compressão das redes sociais
-    videoFilter += ',unsharp=5:5:0.3:5:5:0.3';
-
+    let videoFilter = 'scale=-1:1080:flags=lanczos,crop=ih*(9/16):ih:(iw-ow)/2:0,setsar=1';
     if (subtitlePath && fs.existsSync(subtitlePath)) {
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
       videoFilter += `,subtitles='${escapedPath}'`;
@@ -229,25 +223,25 @@ function runFFmpeg(
       '-map', '0:a:0?',
       '-vf', videoFilter,
       '-af', audioFilter,
-
-      // --- CODEC DE VÍDEO (Qualidade Premium para Redes Sociais) ---
+      
+      // --- CODEC DE VÍDEO (Qualidade Extrema) ---
       '-c:v', 'libx264',
-      '-preset', 'medium',      // Mudado de 'slow' para 'medium' (mais estável)
-      '-crf', '17',             // 17 = qualidade superior
-      '-maxrate', '10M',        // TikTok aceita até 10Mbps
-      '-bufsize', '20M',        // Buffer proporcional
+      '-preset', 'slow', // Mudamos de medium para slow (vale a pena os 2s a mais)
+      '-crf', '18',      // 18 é "Visualmente sem perdas". Se ainda achar ruim, tente 16.
+      '-maxrate', '8M',  // Teto de bitrate para garantir qualidade em cenas rápidas
+      '-bufsize', '16M', // Buffer para o maxrate
       '-profile:v', 'high',
       '-level', '4.2',
       '-pix_fmt', 'yuv420p',
-
+      
       // --- CODEC DE ÁUDIO ---
       '-c:a', 'aac',
-      '-b:a', '192k',           // 192k AAC
-      '-ar', '48000',           // 48kHz profissional
-
+      '-b:a', '192k', // 192k é HD para áudio AAC
+      '-ar', '44100', // Garante compatibilidade
+      
       // --- METADATA ---
-      '-movflags', '+faststart',
-
+      '-movflags', '+faststart', // Vital para web (começa a tocar antes de baixar tudo)
+      
       outputPath
     ];
 
