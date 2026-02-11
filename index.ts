@@ -209,10 +209,11 @@ function runFFmpeg(
     const audioFilter = `afade=t=in:st=0:d=0.08,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
     // Resolução vertical ideal: 1080x1920 (9:16)
-    let videoFilter = 'scale=1080:1920:flags=lanczos,crop=ih*(9/16):ih:(iw-ow)/2:0,setsar=1';
+    // Primeiro escala para 1920 de altura (mantendo aspect ratio), depois crop para 1080 de largura
+    let videoFilter = 'scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1';
 
-    // Pré-sharpening sutil para compensar compressão das redes sociais
-    videoFilter += ',unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5:chroma_msize_x=5:chroma_msize_y=5:chroma_amount=0.5';
+    // Pré-sharpening LEVE para compensar compressão das redes sociais
+    videoFilter += ',unsharp=5:5:0.3:5:5:0.3';
 
     if (subtitlePath && fs.existsSync(subtitlePath)) {
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
@@ -231,22 +232,21 @@ function runFFmpeg(
 
       // --- CODEC DE VÍDEO (Qualidade Premium para Redes Sociais) ---
       '-c:v', 'libx264',
-      '-preset', 'slow',        // Encoding mais cuidadoso (vale os +2s)
-      '-crf', '17',             // 17 = qualidade superior (era 18)
-      '-maxrate', '10M',        // Aumentado de 8M para 10M (TikTok aceita até 10Mbps)
-      '-bufsize', '20M',        // Buffer aumentado proporcionalmente
-      '-profile:v', 'high',     // H.264 High Profile
+      '-preset', 'medium',      // Mudado de 'slow' para 'medium' (mais estável)
+      '-crf', '17',             // 17 = qualidade superior
+      '-maxrate', '10M',        // TikTok aceita até 10Mbps
+      '-bufsize', '20M',        // Buffer proporcional
+      '-profile:v', 'high',
       '-level', '4.2',
-      '-pix_fmt', 'yuv420p',    // Compatibilidade máxima
-      '-x264-params', 'ref=4:bframes=3:b-adapt=2:direct=auto:me=umh:subme=8:trellis=1:aq-mode=1:aq-strength=0.8',
+      '-pix_fmt', 'yuv420p',
 
       // --- CODEC DE ÁUDIO ---
       '-c:a', 'aac',
-      '-b:a', '192k',           // 192k AAC (qualidade HD)
-      '-ar', '48000',           // 48kHz (era 44.1kHz) - padrão profissional
+      '-b:a', '192k',           // 192k AAC
+      '-ar', '48000',           // 48kHz profissional
 
       // --- METADATA ---
-      '-movflags', '+faststart', // Progressive download para web
+      '-movflags', '+faststart',
 
       outputPath
     ];
