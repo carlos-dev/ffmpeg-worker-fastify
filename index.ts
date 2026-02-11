@@ -208,7 +208,11 @@ function runFFmpeg(
     const fadeOutStart = Math.max(0, duration - 0.15);
     const audioFilter = `afade=t=in:st=0:d=0.08,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
-    let videoFilter = 'scale=-1:1080:flags=lanczos,crop=ih*(9/16):ih:(iw-ow)/2:0,setsar=1';
+    let videoFilter = 'scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1';
+
+    // Opcional: Adicionar um filtro de nitidez (unsharp) ajuda a compensar o zoom digital
+    videoFilter += ',unsharp=5:5:0.8:5:5:0.8';
+
     if (subtitlePath && fs.existsSync(subtitlePath)) {
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
       videoFilter += `,subtitles='${escapedPath}'`;
