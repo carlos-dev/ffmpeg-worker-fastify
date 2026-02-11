@@ -208,7 +208,12 @@ function runFFmpeg(
     const fadeOutStart = Math.max(0, duration - 0.15);
     const audioFilter = `afade=t=in:st=0:d=0.08,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
 
-    let videoFilter = 'scale=-1:1080:flags=lanczos,crop=ih*(9/16):ih:(iw-ow)/2:0,setsar=1';
+    // Resolução vertical ideal: 1080x1920 (9:16)
+    let videoFilter = 'scale=1080:1920:flags=lanczos,crop=ih*(9/16):ih:(iw-ow)/2:0,setsar=1';
+
+    // Pré-sharpening sutil para compensar compressão das redes sociais
+    videoFilter += ',unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5:chroma_msize_x=5:chroma_msize_y=5:chroma_amount=0.5';
+
     if (subtitlePath && fs.existsSync(subtitlePath)) {
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
       videoFilter += `,subtitles='${escapedPath}'`;
@@ -223,25 +228,26 @@ function runFFmpeg(
       '-map', '0:a:0?',
       '-vf', videoFilter,
       '-af', audioFilter,
-      
-      // --- CODEC DE VÍDEO (Qualidade Extrema) ---
+
+      // --- CODEC DE VÍDEO (Qualidade Premium para Redes Sociais) ---
       '-c:v', 'libx264',
-      '-preset', 'slow', // Mudamos de medium para slow (vale a pena os 2s a mais)
-      '-crf', '18',      // 18 é "Visualmente sem perdas". Se ainda achar ruim, tente 16.
-      '-maxrate', '8M',  // Teto de bitrate para garantir qualidade em cenas rápidas
-      '-bufsize', '16M', // Buffer para o maxrate
-      '-profile:v', 'high',
+      '-preset', 'slow',        // Encoding mais cuidadoso (vale os +2s)
+      '-crf', '17',             // 17 = qualidade superior (era 18)
+      '-maxrate', '10M',        // Aumentado de 8M para 10M (TikTok aceita até 10Mbps)
+      '-bufsize', '20M',        // Buffer aumentado proporcionalmente
+      '-profile:v', 'high',     // H.264 High Profile
       '-level', '4.2',
-      '-pix_fmt', 'yuv420p',
-      
+      '-pix_fmt', 'yuv420p',    // Compatibilidade máxima
+      '-x264-params', 'ref=4:bframes=3:b-adapt=2:direct=auto:me=umh:subme=8:trellis=1:aq-mode=1:aq-strength=0.8',
+
       // --- CODEC DE ÁUDIO ---
       '-c:a', 'aac',
-      '-b:a', '192k', // 192k é HD para áudio AAC
-      '-ar', '44100', // Garante compatibilidade
-      
+      '-b:a', '192k',           // 192k AAC (qualidade HD)
+      '-ar', '48000',           // 48kHz (era 44.1kHz) - padrão profissional
+
       // --- METADATA ---
-      '-movflags', '+faststart', // Vital para web (começa a tocar antes de baixar tudo)
-      
+      '-movflags', '+faststart', // Progressive download para web
+
       outputPath
     ];
 
