@@ -226,10 +226,10 @@ function runFFmpeg(
       
       // --- CODEC DE VÍDEO (Qualidade Extrema) ---
       '-c:v', 'libx264',
-      '-preset', 'slow', // Mudamos de medium para slow (vale a pena os 2s a mais)
-      '-crf', '18',      // 18 é "Visualmente sem perdas". Se ainda achar ruim, tente 16.
-      '-maxrate', '8M',  // Teto de bitrate para garantir qualidade em cenas rápidas
-      '-bufsize', '16M', // Buffer para o maxrate
+      '-preset', 'veryslow', // Preset mais lento para melhor compressão e qualidade
+      '-crf', '18',      // 18 é o ideal para Web/TikTok (visualmente sem perdas e tamanho ok)
+      '-maxrate', '12M', // 12Mbps é seguro para TikTok e garante qualidade
+      '-bufsize', '24M', // Buffer ajustado
       '-profile:v', 'high',
       '-level', '4.2',
       '-pix_fmt', 'yuv420p',
