@@ -10,19 +10,20 @@ import cors from '@fastify/cors';
 import { randomUUID } from 'crypto';
 import ffmpegPath from 'ffmpeg-static';
 
-// __dirname equivalente para ES modules
+// --- SETUP INICIAL ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const fastify = Fastify({
   logger: true,
-  connectionTimeout: 600000,
-  keepAliveTimeout: 600000
+  connectionTimeout: 600000, // 10 minutos
+  keepAliveTimeout: 600000,
+  bodyLimit: 1048576 * 10 // 10MB para JSON payload
 });
 
 await fastify.register(cors, { origin: true });
 
-// --- CONFIGURAÇÃO ---
+// --- CONFIGURAÇÃO S3/R2 ---
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME || process.env.R2_BUCKET_NAME || '';
 const S3_REGION = process.env.S3_REGION || 'auto';
@@ -45,31 +46,35 @@ function getPublicUrl(fileName: string) {
   return `${S3_ENDPOINT}/${S3_BUCKET_NAME}/${fileName}`;
 }
 
-// --- FUNÇÃO DE NOTIFICAÇÃO AO BACKEND ---
+// --- NOTIFICAÇÃO AO BACKEND ---
 async function notifyBackend(jobId: string, payload: object) {
   try {
+    // Tenta avisar o backend, mas não trava se falhar
     const url = `${BACKEND_URL}/jobs/${jobId}/progress`;
-    // Fire and forget - não bloqueia o processamento
     fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
-    }).catch(err => console.error(`[Webhook Error] Falha ao notificar backend: ${err.message}`));
+    }).catch(err => console.error(`[Webhook Warn] Falha ao notificar backend: ${err.message}`));
   } catch (err) {
     console.error(`[Webhook Error] ${err}`);
   }
 }
 
-// --- UTILITÁRIOS DE TEMPO ---
+// --- UTILS ---
 function timeToSeconds(timeString: string): number {
+  if (!timeString) return 0;
   const parts = timeString.split(':');
-  const h = parseFloat(parts[0]);
-  const m = parseFloat(parts[1]);
-  const s = parseFloat(parts[2]);
-  return (h * 3600) + (m * 60) + s;
+  try {
+    const h = parseFloat(parts[0]);
+    const m = parseFloat(parts[1]);
+    const s = parseFloat(parts[2]);
+    return (h * 3600) + (m * 60) + s;
+  } catch (e) {
+    return 0;
+  }
 }
 
-// --- INTERFACES ---
 interface Word {
   start: number;
   end: number;
@@ -98,22 +103,22 @@ const processSchema = {
   }
 };
 
+// --- DOWNLOADER ---
 async function downloadFile(
   url: string,
   outputPath: string,
   onProgress: (pct: number) => void
 ): Promise<void> {
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`Falha ao baixar: ${response.statusText}`);
+  if (!response.ok) throw new Error(`Falha ao baixar vídeo: ${response.statusText}`);
 
   const totalLength = Number(response.headers.get('content-length'));
   let downloaded = 0;
   let lastReport = 0;
 
   const fileStream = fs.createWriteStream(outputPath);
-
-  if (!response.body) throw new Error('No body');
-
+  
+  if (!response.body) throw new Error('Corpo da resposta vazio');
   const reader = response.body.getReader();
 
   while(true) {
@@ -123,33 +128,32 @@ async function downloadFile(
     downloaded += value.length;
     fileStream.write(value);
 
-    // Retorna percentual bruto (0-100), o caller faz o mapeamento
     if (totalLength) {
       const percent = (downloaded / totalLength) * 100;
-      // Throttle: só notifica a cada 10% para download rápido do R2
-      if (percent - lastReport > 10) {
+      if (percent - lastReport > 10) { // Notifica a cada 10%
         onProgress(percent);
         lastReport = percent;
       }
     }
   }
 
-  // Aguarda o arquivo ser completamente gravado no disco antes de retornar
-  await new Promise<void>((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     fileStream.on('finish', resolve);
     fileStream.on('error', reject);
     fileStream.end();
   });
 }
 
+// --- GERADOR DE LEGENDAS (.ASS) ---
 function generateSubtitleFile(words: Word[], cutStartTime: number, outputPath: string): void {
+  // Configuração visual da legenda (Amarelo com borda preta, fonte Arial Black)
   const ASS_HEADER = `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial Black,85,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,10,10,250,1
+Style: Default,Arial Black,80,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,10,10,280,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
@@ -169,6 +173,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       return date.toISOString().substr(11, 10).replace('.', '.');
     };
 
+    // Efeito Karaoke simples (highlight palavra por palavra)
     let karaokeText = '';
     currentGroup.forEach((w, i) => {
       const duration = Math.round((w.end - w.start) * 100);
@@ -183,10 +188,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
   for (let i = 0; i < words.length; i++) {
     const w = words[i];
-    if (w.end < cutStartTime) continue;
+    if (w.end < cutStartTime) continue; // Pula palavras antes do corte
+
     const prevWord = words[i-1];
+    // Quebra se houver silêncio grande ou muitas letras
     const isBigGap = prevWord && (w.start - prevWord.end > 0.5);
-    if ((currentCharCount + w.word.length > 25) || isBigGap) flushGroup();
+    
+    // Ajuste aqui: max 25 caracteres por linha para caber no celular vertical
+    if ((currentCharCount + w.word.length > 20) || isBigGap) flushGroup();
+
     currentGroup.push(w);
     currentCharCount += w.word.length + 1;
   }
@@ -194,6 +204,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   fs.writeFileSync(outputPath, assContent);
 }
 
+// --- ENGINE FFMPEG (O Coração) ---
 function runFFmpeg(
   inputPath: string,
   outputPath: string,
@@ -205,14 +216,26 @@ function runFFmpeg(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const duration = endTime - startTime;
-    const fadeOutStart = Math.max(0, duration - 0.15);
-    const audioFilter = `afade=t=in:st=0:d=0.08,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.15`;
+    // Fade in/out no áudio para não estourar os ouvidos
+    const fadeOutStart = Math.max(0, duration - 0.5);
+    const audioFilter = `afade=t=in:st=0:d=0.1,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.5`;
 
-    let videoFilter = 'scale=-1:1280:flags=lanczos,crop=720:1280:(iw-720)/2:0,setsar=1';
-    // Opcional: Adicionar um filtro de nitidez (unsharp) ajuda a compensar o zoom digital
-    videoFilter += ',unsharp=5:5:0.8:5:5:0.8';
+    // --- A MÁGICA DO "BLURRED BACKGROUND" ---
+    // 1. Cria duas cópias do vídeo (bg e fg).
+    // 2. BG: Escala para 1920 de altura (preenchendo tudo), corta para 1080x1920, aplica Blur forte e escurece um pouco.
+    // 3. FG: Escala para 1080 de largura (mantendo proporção original).
+    // 4. Overlay: Coloca o FG no centro do BG.
+    let videoFilter = `split[bg][fg]; 
+[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,eq=brightness=-0.1[bg_blurred]; 
+[fg]scale=1080:-1:flags=lanczos[fg_sharp]; 
+[bg_blurred][fg_sharp]overlay=(W-w)/2:(H-h)/2,setsar=1`;
 
+    // Remove quebras de linha da string de filtro
+    videoFilter = videoFilter.replace(/\n/g, '');
+
+    // Adiciona legendas se existirem
     if (subtitlePath && fs.existsSync(subtitlePath)) {
+      // Escape paths para FFmpeg (Windows/Linux safe)
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
       videoFilter += `,subtitles='${escapedPath}'`;
     }
@@ -223,36 +246,42 @@ function runFFmpeg(
       '-i', inputPath,
       '-t', duration.toFixed(3),
       
-      // Limita o uso de Threads para não estourar a CPU/RAM do Railway
-      '-threads', '2', 
-    
+      // Usa threads baseadas no plano Pro (ajuda na velocidade)
+      '-threads', '4',
+
       '-map', '0:v:0',
       '-map', '0:a:0?',
       '-vf', videoFilter,
       '-af', audioFilter,
-    
+      
+      // --- QUALIDADE DE VÍDEO (Ajustado para Pro Plan) ---
       '-c:v', 'libx264',
+      '-preset', 'fast',  // 'fast' é o equilíbrio perfeito. 'veryslow' é desnecessário.
+      '-crf', '23',       // 23 = Alta qualidade visual, arquivo tamanho médio.
       
-      // 'ultrafast': Prioridade total em terminar o job sem travar
-      '-preset', 'ultrafast', 
+      // Limites de Bitrate (Segurança para Mobile)
+      '-maxrate', '6000k',
+      '-bufsize', '12000k',
       
-      // CRF 28: Qualidade um pouco menor, mas muito mais leve para processar
-      '-crf', '28',      
-      
-      '-maxrate', '3000k', // 3Mbps é ok para 720p
-      '-bufsize', '6000k',
-      
+      '-profile:v', 'high',
       '-pix_fmt', 'yuv420p',
       
+      // Áudio
       '-c:a', 'aac',
-      '-b:a', '128k',
+      '-b:a', '192k',
       '-ar', '44100',
       
       '-movflags', '+faststart',
       
       outputPath
     ];
-    const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args, { timeout: 300000 });
+
+    logger.info(`Iniciando FFmpeg...`);
+    
+    const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args, { 
+      timeout: 600000 // 10 minutos max de render
+    });
+    
     let stderrData = '';
     let lastReport = 0;
 
@@ -260,13 +289,12 @@ function runFFmpeg(
       const chunk = data.toString();
       stderrData += chunk;
 
+      // Extrai tempo atual para calcular %
       const timeMatch = chunk.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
       if (timeMatch) {
         const currentTime = timeToSeconds(timeMatch[1]);
-        // Retorna percentual bruto (0-100), o caller faz o mapeamento
         const percent = Math.min(100, (currentTime / duration) * 100);
 
-        // Throttle: só notifica a cada 5% para economizar rede
         if (percent - lastReport > 5) {
           onProgress(percent);
           lastReport = percent;
@@ -278,62 +306,55 @@ function runFFmpeg(
       if (code === 0) {
         resolve();
       } else {
-        logger.error(`FFmpeg falhou (code ${code}). Stderr: ${stderrData.slice(-500)}`);
-        reject(new Error(`FFmpeg error (code ${code}): ${stderrData.slice(-500)}`));
+        logger.error(`FFmpeg falhou. Logs finais: ${stderrData.slice(-1000)}`);
+        reject(new Error(`FFmpeg error code ${code}`));
       }
     });
-    ffmpeg.on('error', (err) => reject(new Error(`FFmpeg spawn error: ${err.message}`)));
+
+    ffmpeg.on('error', (err) => reject(new Error(`FFmpeg falhou ao iniciar: ${err.message}`)));
   });
 }
 
-// --- ROTA PRINCIPAL ---
+// --- ROTA DA API ---
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   schema: processSchema
 }, async (request, reply) => {
   const { videoUrl, startTime, endTime, jobId, words } = request.body;
+  const log = request.log;
 
   const tempDir = os.tmpdir();
   const executionId = randomUUID();
-  const inputPath = path.join(tempDir, `input_${executionId}.mp4`);
-  const outputPath = path.join(tempDir, `output_${executionId}.mp4`);
+  const inputPath = path.join(tempDir, `in_${executionId}.mp4`);
+  const outputPath = path.join(tempDir, `out_${executionId}.mp4`);
   const subtitlePath = path.join(tempDir, `sub_${executionId}.ass`);
-  const finalFileName = `cuts/${jobId}_${Date.now()}_${executionId.slice(0, 5)}.mp4`;
-
-  // Nova escala de progresso:
-  // n8n: 0% → 50% (transcrição, GPT, seleção de cortes)
-  // Worker: 50% → 100% (download R2, renderização, upload)
-  //   - Download R2: 50% → 55% (rápido)
-  //   - Renderização: 55% → 95%
-  //   - Upload: 95% → 100%
+  const finalFileName = `cuts/${jobId}_${Date.now()}.mp4`;
 
   try {
-    // Notifica o backend que o Worker começou (50%)
-    notifyBackend(jobId, { status: 'rendering', progress: 50, message: 'Worker iniciado' });
-
-    // 1. Download do R2 (50% → 55%) - rápido pois é do próprio cloud
+    // 1. Download (50% -> 60%)
+    notifyBackend(jobId, { status: 'rendering', progress: 50, message: 'Baixando vídeo...' });
     await downloadFile(videoUrl, inputPath, (pct) => {
-      // pct vai de 0 a 100, mapeia para 50 a 55
-      const globalPct = 50 + (pct / 100) * 5;
+      const globalPct = 50 + (pct / 100) * 10;
       notifyBackend(jobId, { status: 'downloading', progress: Math.floor(globalPct) });
     });
 
     // 2. Legendas
     let subPathArg: string | undefined;
     if (words && words.length > 0) {
+      log.info('Gerando arquivo de legendas...');
       generateSubtitleFile(words, startTime, subtitlePath);
       subPathArg = subtitlePath;
     }
 
-    // 3. Renderização (55% → 95%)
+    // 3. Renderização (60% -> 90%)
+    log.info('Iniciando renderização FFmpeg High Quality...');
     await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, (pct) => {
-      // pct vai de 0 a 100, mapeia para 55 a 95
-      const globalPct = 55 + (pct / 100) * 40;
+      const globalPct = 60 + (pct / 100) * 30;
       notifyBackend(jobId, { status: 'rendering', progress: Math.floor(globalPct) });
-    }, request.log);
+    }, log);
 
-    // 4. Upload (95% → 100%)
-    notifyBackend(jobId, { status: 'uploading', progress: 95 });
-
+    // 4. Upload (90% -> 100%)
+    notifyBackend(jobId, { status: 'uploading', progress: 95, message: 'Enviando para nuvem...' });
+    
     const fileBuffer = fs.readFileSync(outputPath);
     await s3Client.send(new PutObjectCommand({
       Bucket: S3_BUCKET_NAME,
@@ -344,24 +365,20 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
 
     const publicUrl = getPublicUrl(finalFileName);
 
-    // Notifica sucesso final
+    log.info(`Job ${jobId} concluído com sucesso!`);
+
     const result = { status: 'completed', progress: 100, url: publicUrl, success: true };
     notifyBackend(jobId, result);
-
-    // Retorna JSON para o n8n
     return result;
 
   } catch (err) {
     const error = err as Error;
-    request.log.error(`Erro: ${error.message}`);
-
-    // Notifica erro ao backend
+    log.error(`Erro fatal no Job ${jobId}: ${error.message}`);
     notifyBackend(jobId, { status: 'error', progress: 0, error: error.message });
+    reply.code(500).send({ success: false, error: error.message });
 
-    reply.code(500);
-    return { success: false, error: error.message };
   } finally {
-    // Limpa arquivos temporários
+    // Limpeza (sempre limpe o tmp!)
     [inputPath, outputPath, subtitlePath].forEach(p => {
       try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
     });
