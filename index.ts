@@ -87,6 +87,7 @@ interface ProcessVideoBody {
   endTime: number;
   jobId: string;
   words: Word[];
+  renderStyle?: 'blur' | 'crop';
 }
 
 const processSchema = {
@@ -98,7 +99,8 @@ const processSchema = {
       startTime: { type: 'number' },
       endTime: { type: 'number' },
       jobId: { type: 'string' },
-      words: { type: 'array' }
+      words: { type: 'array' },
+      renderStyle: { type: 'string', enum: ['blur', 'crop'], default: 'blur' }
     }
   }
 };
@@ -212,7 +214,8 @@ function runFFmpeg(
   endTime: number,
   subtitlePath: string | undefined,
   onProgress: (pct: number) => void,
-  logger: any
+  logger: any,
+  renderStyle: 'blur' | 'crop' = 'blur'
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const duration = endTime - startTime;
@@ -220,17 +223,23 @@ function runFFmpeg(
     const fadeOutStart = Math.max(0, duration - 0.5);
     const audioFilter = `afade=t=in:st=0:d=0.1,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.5`;
 
-    // --- A MÁGICA DO "BLURRED BACKGROUND" ---
-    // 1. Cria duas cópias do vídeo (bg e fg).
-    // 2. BG: Escala para 1920 de altura (preenchendo tudo), corta para 1080x1920, aplica Blur forte e escurece um pouco.
-    // 3. FG: Escala para 1080 de largura (mantendo proporção original).
-    // 4. Overlay: Coloca o FG no centro do BG.
-    let videoFilter = `split[bg][fg]; 
-[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,eq=brightness=-0.1[bg_blurred]; 
-[fg]scale=1080:-1:flags=lanczos[fg_sharp]; 
-[bg_blurred][fg_sharp]overlay=(W-w)/2:(H-h)/2,setsar=1`;
+    let videoFilter: string;
 
-    // Remove quebras de linha da string de filtro
+    if (renderStyle === 'crop') {
+      // --- MODO CROP: "Zoom" centralizado ---
+      // Escala a altura para 1920px (mantendo proporção), depois corta o excesso lateral
+      // para preencher 1080x1920 inteiros. Resultado: tela cheia, sem barras.
+      videoFilter = `scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1`;
+    } else {
+      // --- MODO BLUR (Padrão): "Blurred Background" ---
+      // 1. Cria duas cópias do vídeo (bg e fg).
+      // 2. BG: Escala para 1920 de altura (preenchendo tudo), corta para 1080x1920, aplica Blur forte e escurece um pouco.
+      // 3. FG: Escala para 1080 de largura (mantendo proporção original).
+      // 4. Overlay: Coloca o FG no centro do BG.
+      videoFilter = `split[bg][fg]; [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,eq=brightness=-0.1[bg_blurred]; [fg]scale=1080:-1:flags=lanczos[fg_sharp]; [bg_blurred][fg_sharp]overlay=(W-w)/2:(H-h)/2,setsar=1`;
+    }
+
+    // Remove quebras de linha da string de filtro (segurança)
     videoFilter = videoFilter.replace(/\n/g, '');
 
     // Adiciona legendas se existirem
@@ -319,7 +328,8 @@ function runFFmpeg(
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   schema: processSchema
 }, async (request, reply) => {
-  const { videoUrl, startTime, endTime, jobId, words } = request.body;
+  const { videoUrl, startTime, endTime, jobId, words, renderStyle } = request.body;
+  const style = renderStyle || 'blur';
   const log = request.log;
 
   const tempDir = os.tmpdir();
@@ -346,11 +356,11 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
     }
 
     // 3. Renderização (60% -> 90%)
-    log.info('Iniciando renderização FFmpeg High Quality...');
+    log.info(`Iniciando renderização FFmpeg [${style}] High Quality...`);
     await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, (pct) => {
       const globalPct = 60 + (pct / 100) * 30;
       notifyBackend(jobId, { status: 'rendering', progress: Math.floor(globalPct) });
-    }, log);
+    }, log, style);
 
     // 4. Upload (90% -> 100%)
     notifyBackend(jobId, { status: 'uploading', progress: 95, message: 'Enviando para nuvem...' });
