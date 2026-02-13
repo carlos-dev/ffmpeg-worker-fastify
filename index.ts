@@ -8,7 +8,21 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { randomUUID } from 'crypto';
-import ffmpegPath from 'ffmpeg-static';
+import ffmpegStaticPath from 'ffmpeg-static';
+
+// Prefere o FFmpeg do sistema (instalado via apt-get, tem drawtext/libfreetype)
+// Fallback para ffmpeg-static (npm, build minimalista SEM drawtext)
+function resolveFFmpegBinary(): string {
+  // Caminhos comuns do FFmpeg no sistema
+  const systemPaths = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'];
+  for (const p of systemPaths) {
+    if (fs.existsSync(p)) return p;
+  }
+  // Fallback para ffmpeg-static (npm) ou comando genérico
+  return ffmpegStaticPath || 'ffmpeg';
+}
+
+const ffmpegBinary = resolveFFmpegBinary();
 
 // --- SETUP INICIAL ---
 const __filename = fileURLToPath(import.meta.url);
@@ -286,9 +300,15 @@ function runFFmpeg(
 
     if (renderStyle === 'crop') {
       // --- MODO CROP: "Zoom" centralizado ---
+      // Escala a altura para 1920px (mantendo proporção), depois corta o excesso lateral
+      // para preencher 1080x1920 inteiros. Resultado: tela cheia, sem barras.
       videoFilter = `scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1`;
     } else {
       // --- MODO BLUR (Padrão): "Blurred Background" ---
+      // 1. Cria duas cópias do vídeo (bg e fg).
+      // 2. BG: Escala para 1920 de altura (preenchendo tudo), corta para 1080x1920, aplica Blur forte e escurece um pouco.
+      // 3. FG: Escala para 1080 de largura (mantendo proporção original).
+      // 4. Overlay: Coloca o FG no centro do BG.
       videoFilter = `split[bg][fg]; [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,eq=brightness=-0.1[bg_blurred]; [fg]scale=1080:-1:flags=lanczos[fg_sharp]; [bg_blurred][fg_sharp]overlay=(W-w)/2:(H-h)/2,setsar=1`;
     }
 
@@ -306,13 +326,18 @@ function runFFmpeg(
     if (viralHeadline && viralHeadline.trim().length > 0) {
       const wrappedText = wrapText(viralHeadline.trim(), 20);
       const escapedText = escapeDrawtext(wrappedText);
-      const fontPath = path.join(__dirname, 'assets', 'fonts', 'Montserrat-ExtraBold.ttf')
-        .replace(/\\/g, '/')
-        .replace(/:/g, '\\:');
 
-      logger.info(`Adicionando título viral: "${viralHeadline}" (escaped: "${escapedText}")`);
+      // __dirname = /app/dist em produção (compilado), assets fica em /app/assets
+      // Em dev, __dirname = pasta do projeto, assets fica no mesmo nível
+      const fontPath = path.resolve(__dirname, '..', 'assets', 'fonts', 'Montserrat-Bold.ttf');
+      const fontPathEscaped = fontPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
-      videoFilter += `,drawtext=fontfile='${fontPath}':text='${escapedText}':fontcolor=white:fontsize=52:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=280`;
+      if (!fs.existsSync(fontPath)) {
+        logger.warn(`Fonte não encontrada em: ${fontPath}. Título viral será ignorado.`);
+      } else {
+        logger.info(`Adicionando título viral: "${viralHeadline}" (font: ${fontPath})`);
+        videoFilter += `,drawtext=fontfile='${fontPathEscaped}':text='${escapedText}':fontcolor=white:fontsize=52:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=280`;
+      }
     }
 
     const args = [
@@ -351,9 +376,9 @@ function runFFmpeg(
       outputPath
     ];
 
-    logger.info(`Iniciando FFmpeg...`);
+    logger.info(`Iniciando FFmpeg (${ffmpegBinary})...`);
     
-    const ffmpeg = spawn(ffmpegPath || 'ffmpeg', args, { 
+    const ffmpeg = spawn(ffmpegBinary, args, { 
       timeout: 600000 // 10 minutos max de render
     });
     

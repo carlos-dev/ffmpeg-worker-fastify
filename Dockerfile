@@ -1,7 +1,7 @@
 FROM node:20-slim
 
-# 1. Instala o FFmpeg (Obrigatório)
-RUN apt-get update && apt-get install -y ffmpeg
+# 1. Instala FFmpeg com suporte completo (drawtext requer libfreetype + fontconfig)
+RUN apt-get update && apt-get install -y ffmpeg fontconfig libfreetype6 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
