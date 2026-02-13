@@ -88,6 +88,8 @@ interface ProcessVideoBody {
   jobId: string;
   words: Word[];
   renderStyle?: 'blur' | 'crop';
+  hasViralTitle?: boolean;
+  viralHeadline?: string;
 }
 
 const processSchema = {
@@ -100,10 +102,66 @@ const processSchema = {
       endTime: { type: 'number' },
       jobId: { type: 'string' },
       words: { type: 'array' },
-      renderStyle: { type: 'string', enum: ['blur', 'crop'], default: 'blur' }
+      renderStyle: { type: 'string', enum: ['blur', 'crop'], default: 'blur' },
+      hasViralTitle: { type: 'boolean', default: false },
+      viralHeadline: { type: 'string' }
     }
   }
 };
+
+// --- HELPERS PARA TÍTULO VIRAL ---
+
+/**
+ * Quebra o texto em múltiplas linhas inserindo \n a cada ~maxChars caracteres,
+ * respeitando limites de palavra (não corta no meio).
+ */
+function wrapText(text: string, maxChars: number = 20): string {
+  const words = text.split(' ');
+  const lines: string[] = [];
+  let currentLine = '';
+
+  for (const word of words) {
+    if (currentLine.length === 0) {
+      currentLine = word;
+    } else if ((currentLine + ' ' + word).length <= maxChars) {
+      currentLine += ' ' + word;
+    } else {
+      lines.push(currentLine);
+      currentLine = word;
+    }
+  }
+  if (currentLine.length > 0) {
+    lines.push(currentLine);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Escapa caracteres especiais para o filtro drawtext do FFmpeg.
+ * Como passamos via -vf (não via textfile), precisamos tratar os chars
+ * que o FFmpeg usa como delimitadores no filtergraph e no drawtext.
+ *
+ * Nível 1: FFmpeg filtergraph escapes  -> ; , [ ] '
+ * Nível 2: drawtext key=value escapes  -> : \
+ * 
+ * A abordagem mais segura: usar a opção text= com aspas simples
+ * e escapar somente o mínimo necessário.
+ */
+function escapeDrawtext(text: string): string {
+  // 1. Escapa barras invertidas primeiro (antes de qualquer outro replace)
+  let escaped = text.replace(/\\/g, '\\\\');
+  // 2. Escapa aspas simples para drawtext: ' -> '\''
+  //    (fecha aspas, insere aspas escapada, reabre aspas)
+  escaped = escaped.replace(/'/g, "'\\''");
+  // 3. Escapa dois-pontos (delimitador key=value do drawtext)
+  escaped = escaped.replace(/:/g, '\\:');
+  // 4. Escapa percentuais (FFmpeg usa % para expressões)
+  escaped = escaped.replace(/%/g, '%%');
+  // 5. Escapa ponto-e-vírgula (delimitador de filtros no filtergraph)
+  escaped = escaped.replace(/;/g, '\\;');
+  return escaped;
+}
 
 // --- DOWNLOADER ---
 async function downloadFile(
@@ -215,7 +273,8 @@ function runFFmpeg(
   subtitlePath: string | undefined,
   onProgress: (pct: number) => void,
   logger: any,
-  renderStyle: 'blur' | 'crop' = 'blur'
+  renderStyle: 'blur' | 'crop' = 'blur',
+  viralHeadline?: string
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const duration = endTime - startTime;
@@ -227,15 +286,9 @@ function runFFmpeg(
 
     if (renderStyle === 'crop') {
       // --- MODO CROP: "Zoom" centralizado ---
-      // Escala a altura para 1920px (mantendo proporção), depois corta o excesso lateral
-      // para preencher 1080x1920 inteiros. Resultado: tela cheia, sem barras.
       videoFilter = `scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1`;
     } else {
       // --- MODO BLUR (Padrão): "Blurred Background" ---
-      // 1. Cria duas cópias do vídeo (bg e fg).
-      // 2. BG: Escala para 1920 de altura (preenchendo tudo), corta para 1080x1920, aplica Blur forte e escurece um pouco.
-      // 3. FG: Escala para 1080 de largura (mantendo proporção original).
-      // 4. Overlay: Coloca o FG no centro do BG.
       videoFilter = `split[bg][fg]; [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,eq=brightness=-0.1[bg_blurred]; [fg]scale=1080:-1:flags=lanczos[fg_sharp]; [bg_blurred][fg_sharp]overlay=(W-w)/2:(H-h)/2,setsar=1`;
     }
 
@@ -244,9 +297,22 @@ function runFFmpeg(
 
     // Adiciona legendas se existirem
     if (subtitlePath && fs.existsSync(subtitlePath)) {
-      // Escape paths para FFmpeg (Windows/Linux safe)
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
       videoFilter += `,subtitles='${escapedPath}'`;
+    }
+
+    // --- TÍTULO VIRAL (drawtext) ---
+    // Aplicado APÓS scale/crop para ficar na resolução correta (1080x1920)
+    if (viralHeadline && viralHeadline.trim().length > 0) {
+      const wrappedText = wrapText(viralHeadline.trim(), 20);
+      const escapedText = escapeDrawtext(wrappedText);
+      const fontPath = path.join(__dirname, 'assets', 'fonts', 'Montserrat-ExtraBold.ttf')
+        .replace(/\\/g, '/')
+        .replace(/:/g, '\\:');
+
+      logger.info(`Adicionando título viral: "${viralHeadline}" (escaped: "${escapedText}")`);
+
+      videoFilter += `,drawtext=fontfile='${fontPath}':text='${escapedText}':fontcolor=white:fontsize=52:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=280`;
     }
 
     const args = [
@@ -328,8 +394,9 @@ function runFFmpeg(
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   schema: processSchema
 }, async (request, reply) => {
-  const { videoUrl, startTime, endTime, jobId, words, renderStyle } = request.body;
+  const { videoUrl, startTime, endTime, jobId, words, renderStyle, hasViralTitle, viralHeadline } = request.body;
   const style = renderStyle || 'blur';
+  const headline = (hasViralTitle && viralHeadline) ? viralHeadline : undefined;
   const log = request.log;
 
   const tempDir = os.tmpdir();
@@ -356,11 +423,11 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
     }
 
     // 3. Renderização (60% -> 90%)
-    log.info(`Iniciando renderização FFmpeg [${style}] High Quality...`);
+    log.info(`Iniciando renderização FFmpeg [${style}]${headline ? ' + Título Viral' : ''} High Quality...`);
     await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, (pct) => {
       const globalPct = 60 + (pct / 100) * 30;
       notifyBackend(jobId, { status: 'rendering', progress: Math.floor(globalPct) });
-    }, log, style);
+    }, log, style, headline);
 
     // 4. Upload (90% -> 100%)
     notifyBackend(jobId, { status: 'uploading', progress: 95, message: 'Enviando para nuvem...' });
