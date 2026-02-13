@@ -336,9 +336,9 @@ function runFFmpeg(
         logger.warn(`Fonte não encontrada em: ${fontPath}. Título viral será ignorado.`);
       } else {
         logger.info(`Adicionando título viral: "${viralHeadline}" (font: ${fontPath})`);
-        // text_align=C -> centraliza texto multiline
         // line_spacing=14 -> aumenta espaçamento entre linhas
-        videoFilter += `,drawtext=fontfile='${fontPathEscaped}':text='${escapedText}':fontcolor=white:fontsize=52:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=280:text_align=C:line_spacing=14`;
+        // x=(w-text_w)/2 -> centraliza horizontalmente
+        videoFilter += `,drawtext=fontfile='${fontPathEscaped}':text='${escapedText}':fontcolor=white:fontsize=52:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=280:line_spacing=14`;
       }
     }
 
