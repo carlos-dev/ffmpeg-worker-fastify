@@ -126,10 +126,10 @@ const processSchema = {
 // --- HELPERS PARA TÍTULO VIRAL ---
 
 /**
- * Quebra o texto em múltiplas linhas inserindo \n a cada ~maxChars caracteres,
+ * Quebra o texto em múltiplas linhas (array) a cada ~maxChars caracteres,
  * respeitando limites de palavra (não corta no meio).
  */
-function wrapText(text: string, maxChars: number = 20): string {
+function wrapTextLines(text: string, maxChars: number = 20): string[] {
   const words = text.split(' ');
   const lines: string[] = [];
   let currentLine = '';
@@ -148,7 +148,7 @@ function wrapText(text: string, maxChars: number = 20): string {
     lines.push(currentLine);
   }
 
-  return lines.join('\n');
+  return lines;
 }
 
 /**
@@ -323,22 +323,28 @@ function runFFmpeg(
 
     // --- TÍTULO VIRAL (drawtext) ---
     // Aplicado APÓS scale/crop para ficar na resolução correta (1080x1920)
+    // Usa um drawtext POR LINHA para que cada uma fique centralizada independentemente.
     if (viralHeadline && viralHeadline.trim().length > 0) {
-      const wrappedText = wrapText(viralHeadline.trim(), 20);
-      const escapedText = escapeDrawtext(wrappedText);
+      const lines = wrapTextLines(viralHeadline.trim(), 20);
 
       // __dirname = /app/dist em produção (compilado), assets fica em /app/assets
-      // Em dev, __dirname = pasta do projeto, assets fica no mesmo nível
       const fontPath = path.resolve(__dirname, '..', 'assets', 'fonts', 'Montserrat-BoldItalic.ttf');
       const fontPathEscaped = fontPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
       if (!fs.existsSync(fontPath)) {
         logger.warn(`Fonte não encontrada em: ${fontPath}. Título viral será ignorado.`);
       } else {
-        logger.info(`Adicionando título viral: "${viralHeadline}" (font: ${fontPath})`);
-        // line_spacing=14 -> aumenta espaçamento entre linhas
-        // x=(w-text_w)/2 -> centraliza horizontalmente
-        videoFilter += `,drawtext=fontfile='${fontPathEscaped}':text='${escapedText}':fontcolor=white:fontsize=52:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=280:line_spacing=14`;
+        logger.info(`Adicionando título viral: "${viralHeadline}" (${lines.length} linhas, font: ${fontPath})`);
+
+        const fontSize = 52;
+        const lineHeight = fontSize + 14; // fontSize + espaçamento extra
+        const baseY = 280;
+
+        for (let i = 0; i < lines.length; i++) {
+          const escapedLine = escapeDrawtext(lines[i]);
+          const yPos = baseY + (i * lineHeight);
+          videoFilter += `,drawtext=fontfile='${fontPathEscaped}':text='${escapedLine}':fontcolor=white:fontsize=${fontSize}:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=${yPos}`;
+        }
       }
     }
 
