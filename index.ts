@@ -2,7 +2,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import Fastify from 'fastify';
@@ -101,7 +101,7 @@ interface ProcessVideoBody {
   endTime: number;
   jobId: string;
   words: Word[];
-  renderStyle?: 'blur' | 'crop';
+  renderStyle?: 'blur' | 'crop' | 'face-track';
   hasViralTitle?: boolean;
   viralHeadline?: string;
   // Subtitle style params
@@ -122,7 +122,7 @@ const processSchema = {
       endTime: { type: 'number' },
       jobId: { type: 'string' },
       words: { type: 'array' },
-      renderStyle: { type: 'string', enum: ['blur', 'crop'], default: 'blur' },
+      renderStyle: { type: 'string', enum: ['blur', 'crop', 'face-track'], default: 'blur' },
       hasViralTitle: { type: 'boolean', default: false },
       viralHeadline: { type: 'string' },
       subtitleColor: { type: 'string' },
@@ -350,6 +350,114 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   fs.writeFileSync(outputPath, assContent);
 }
 
+// --- FACE TRACKING ---
+
+interface FaceDetection {
+  time: number;
+  x: number | null;
+  y: number | null;
+  w: number | null;
+  h: number | null;
+  confidence: number;
+}
+
+interface FaceData {
+  fps: number;
+  width: number;
+  height: number;
+  duration: number;
+  detections: FaceDetection[];
+}
+
+function runFaceDetection(inputPath: string, outputPath: string, logger: any): FaceData {
+  const scriptPath = path.resolve(__dirname, '..', 'detect-faces.py');
+  const cmd = `python3 "${scriptPath}" --input "${inputPath}" --output "${outputPath}" --interval 0.5`;
+  logger.info(`Running face detection: ${cmd}`);
+  execSync(cmd, { timeout: 120000 });
+  const data = JSON.parse(fs.readFileSync(outputPath, 'utf-8'));
+  logger.info(`Face detection complete: ${data.detections.length} samples`);
+  return data;
+}
+
+function calculateFaceTrackCrop(faceData: FaceData): string {
+  const { width, height, detections } = faceData;
+
+  // Target crop: 9:16 aspect ratio from original frame
+  const cropH = height;
+  const cropW = Math.round(height * 9 / 16);
+
+  // If video is narrower than 9:16, just center
+  if (cropW >= width) {
+    return `crop=${width}:${height}:0:0,scale=1080:1920,setsar=1`;
+  }
+
+  // Filter valid detections (with face found)
+  const validDetections = detections.filter(d => d.x !== null);
+
+  // If no faces detected at all, center crop
+  if (validDetections.length === 0) {
+    const centerX = Math.round((width - cropW) / 2);
+    return `crop=${cropW}:${cropH}:${centerX}:0,scale=1080:1920,setsar=1`;
+  }
+
+  // Calculate crop X for each detection (center crop on face)
+  const cropPositions: Array<{ time: number; cropX: number } | null> = detections.map(d => {
+    if (d.x === null || d.w === null) return null;
+    const faceCenterX = d.x + d.w / 2;
+    let cropX = Math.round(faceCenterX - cropW / 2);
+    cropX = Math.max(0, Math.min(cropX, width - cropW));
+    return { time: d.time, cropX };
+  });
+
+  // Fill nulls with nearest valid position (forward pass)
+  let lastValid: number | null = null;
+  for (let i = 0; i < cropPositions.length; i++) {
+    if (cropPositions[i] !== null) {
+      lastValid = cropPositions[i]!.cropX;
+    } else if (lastValid !== null) {
+      cropPositions[i] = { time: detections[i].time, cropX: lastValid };
+    }
+  }
+  // Backward pass for nulls at the start
+  lastValid = null;
+  for (let i = cropPositions.length - 1; i >= 0; i--) {
+    if (cropPositions[i] !== null) {
+      lastValid = cropPositions[i]!.cropX;
+    } else if (lastValid !== null) {
+      cropPositions[i] = { time: detections[i].time, cropX: lastValid };
+    }
+  }
+
+  // Apply dead zone: if movement < 5% of frame width, don't move
+  const deadZone = width * 0.05;
+  const smoothed: Array<{ time: number; cropX: number }> = [];
+  let currentX = cropPositions[0]!.cropX;
+
+  for (const pos of cropPositions) {
+    if (pos === null) continue;
+    if (Math.abs(pos.cropX - currentX) > deadZone) {
+      currentX = pos.cropX;
+    }
+    smoothed.push({ time: pos.time, cropX: currentX });
+  }
+
+  // Generate sendcmd content
+  let sendcmdContent = '';
+  for (const pos of smoothed) {
+    sendcmdContent += `${pos.time.toFixed(3)} [enter] crop x ${pos.cropX};\n`;
+  }
+
+  // Write sendcmd file
+  const sendcmdPath = path.join(os.tmpdir(), `sendcmd_${randomUUID()}.txt`);
+  fs.writeFileSync(sendcmdPath, sendcmdContent);
+
+  // Initial crop position
+  const initialX = smoothed[0]?.cropX ?? Math.round((width - cropW) / 2);
+
+  const escapedSendcmd = sendcmdPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+  return `sendcmd=f='${escapedSendcmd}',crop=${cropW}:${cropH}:${initialX}:0,scale=1080:1920,setsar=1`;
+}
+
 // --- ENGINE FFMPEG (O Coração) ---
 function runFFmpeg(
   inputPath: string,
@@ -359,8 +467,9 @@ function runFFmpeg(
   subtitlePath: string | undefined,
   onProgress: (pct: number) => void,
   logger: any,
-  renderStyle: 'blur' | 'crop' = 'blur',
-  viralHeadline?: string
+  renderStyle: 'blur' | 'crop' | 'face-track' = 'blur',
+  viralHeadline?: string,
+  faceTrackFilter?: string
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const duration = endTime - startTime;
@@ -370,17 +479,11 @@ function runFFmpeg(
 
     let videoFilter: string;
 
-    if (renderStyle === 'crop') {
-      // --- MODO CROP: "Zoom" centralizado ---
-      // Escala a altura para 1920px (mantendo proporção), depois corta o excesso lateral
-      // para preencher 1080x1920 inteiros. Resultado: tela cheia, sem barras.
+    if (renderStyle === 'face-track' && faceTrackFilter) {
+      videoFilter = faceTrackFilter;
+    } else if (renderStyle === 'crop') {
       videoFilter = `scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1`;
     } else {
-      // --- MODO BLUR (Padrão): "Blurred Background" ---
-      // 1. Cria duas cópias do vídeo (bg e fg).
-      // 2. BG: Escala para 1920 de altura (preenchendo tudo), corta para 1080x1920, aplica Blur forte e escurece um pouco.
-      // 3. FG: Escala para 1080 de largura (mantendo proporção original).
-      // 4. Overlay: Coloca o FG no centro do BG.
       videoFilter = `split[bg][fg]; [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,eq=brightness=-0.1[bg_blurred]; [fg]scale=1080:-1:flags=lanczos[fg_sharp]; [bg_blurred][fg_sharp]overlay=(W-w)/2:(H-h)/2,setsar=1`;
     }
 
@@ -519,6 +622,22 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
       notifyBackend(jobId, { status: 'downloading', progress: Math.floor(globalPct) });
     });
 
+    // Face tracking detection (if enabled)
+    let faceTrackFilter: string | undefined;
+    if (style === 'face-track') {
+      const facesPath = path.join(tempDir, `faces_${executionId}.json`);
+      try {
+        notifyBackend(jobId, { status: 'rendering', progress: 55, message: 'Detectando rostos...' });
+        const faceData = runFaceDetection(inputPath, facesPath, log);
+        faceTrackFilter = calculateFaceTrackCrop(faceData);
+        log.info('Face track filter generated');
+      } catch (err) {
+        log.warn(`Face detection failed, falling back to crop: ${(err as Error).message}`);
+      } finally {
+        try { if (fs.existsSync(facesPath)) fs.unlinkSync(facesPath); } catch {}
+      }
+    }
+
     // 2. Legendas
     let subPathArg: string | undefined;
     if (words && words.length > 0) {
@@ -538,7 +657,7 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
     await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, (pct) => {
       const globalPct = 60 + (pct / 100) * 30;
       notifyBackend(jobId, { status: 'rendering', progress: Math.floor(globalPct) });
-    }, log, style, headline);
+    }, log, style, headline, faceTrackFilter);
 
     // 4. Upload (90% -> 100%)
     notifyBackend(jobId, { status: 'uploading', progress: 95, message: 'Enviando para nuvem...' });
