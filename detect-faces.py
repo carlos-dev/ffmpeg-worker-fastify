@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Face detection script for CutCast face-track render mode.
-Uses OpenCV Haar Cascade (built into opencv-python-headless, no extra dependencies).
+Uses OpenCV FaceDetectorYN (DNN-based, works in OpenCV 4.5+ and 5.x).
 
 Usage: python3 detect-faces.py --input video.mp4 --output faces.json --interval 0.5
 """
@@ -9,8 +9,25 @@ Usage: python3 detect-faces.py --input video.mp4 --output faces.json --interval 
 import argparse
 import json
 import sys
-import cv2
 import os
+import urllib.request
+import cv2
+
+
+MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
+MODEL_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+
+
+def get_model_path():
+    """Get the YuNet face detection model (bundled in repo)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(script_dir, MODEL_FILENAME)
+
+    if not os.path.exists(model_path):
+        print(f"Error: Model not found at {model_path}. It should be bundled in the repo.", file=sys.stderr)
+        sys.exit(1)
+
+    return model_path
 
 
 def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
@@ -27,13 +44,16 @@ def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
 
     print(f"Video: {width}x{height} @ {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
 
-    # Use OpenCV's built-in Haar Cascade for face detection
-    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    if not os.path.exists(cascade_path):
-        print(f"Error: Haar cascade not found at {cascade_path}", file=sys.stderr)
-        sys.exit(1)
-
-    face_cascade = cv2.CascadeClassifier(cascade_path)
+    # Initialize YuNet face detector
+    model_path = get_model_path()
+    detector = cv2.FaceDetectorYN.create(
+        model_path,
+        "",
+        (width, height),
+        0.5,   # score threshold
+        0.3,   # nms threshold
+        5000   # top_k
+    )
 
     detections = []
     frame_interval = int(fps * interval)
@@ -51,31 +71,35 @@ def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
         if frame_idx % frame_interval == 0:
             time_sec = frame_idx / fps
 
-            # Convert to grayscale for Haar cascade
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
             # Detect faces
-            faces = face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=(int(width * 0.05), int(height * 0.05))  # Min face size: 5% of frame
-            )
+            _, faces = detector.detect(frame)
 
             detection = None
 
-            if len(faces) > 0:
-                # Pick the largest face (most likely the main subject)
-                largest = max(faces, key=lambda f: f[2] * f[3])
-                x, y, w, h = largest
+            if faces is not None and len(faces) > 0:
+                # Pick face with highest confidence (last column is score)
+                best_idx = faces[:, -1].argmax()
+                face = faces[best_idx]
+
+                x = int(face[0])
+                y = int(face[1])
+                w = int(face[2])
+                h = int(face[3])
+                confidence = float(face[-1])
+
+                # Clamp to frame bounds
+                x = max(0, min(x, width - 1))
+                y = max(0, min(y, height - 1))
+                w = min(w, width - x)
+                h = min(h, height - y)
 
                 detection = {
                     "time": round(time_sec, 3),
-                    "x": int(x),
-                    "y": int(y),
-                    "w": int(w),
-                    "h": int(h),
-                    "confidence": 0.9
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "confidence": round(confidence, 3)
                 }
             else:
                 detection = {
