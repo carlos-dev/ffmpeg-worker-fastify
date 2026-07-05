@@ -104,6 +104,12 @@ interface ProcessVideoBody {
   renderStyle?: 'blur' | 'crop';
   hasViralTitle?: boolean;
   viralHeadline?: string;
+  // Subtitle style params
+  subtitleColor?: string;           // hex color like '#FFFFFF'
+  subtitleHighlightColor?: string;  // hex color like '#FFFF00'
+  subtitlePosition?: string;        // 'bottom' | 'center' | 'top'
+  subtitleSize?: string;            // 'small' | 'medium' | 'large'
+  subtitleBackground?: string;      // 'shadow' | 'box' | 'outline'
 }
 
 const processSchema = {
@@ -118,7 +124,12 @@ const processSchema = {
       words: { type: 'array' },
       renderStyle: { type: 'string', enum: ['blur', 'crop'], default: 'blur' },
       hasViralTitle: { type: 'boolean', default: false },
-      viralHeadline: { type: 'string' }
+      viralHeadline: { type: 'string' },
+      subtitleColor: { type: 'string' },
+      subtitleHighlightColor: { type: 'string' },
+      subtitlePosition: { type: 'string' },
+      subtitleSize: { type: 'string' },
+      subtitleBackground: { type: 'string' }
     }
   }
 };
@@ -219,15 +230,76 @@ async function downloadFile(
 }
 
 // --- GERADOR DE LEGENDAS (.ASS) ---
-function generateSubtitleFile(words: Word[], cutStartTime: number, outputPath: string): void {
-  // Configuração visual da legenda (Amarelo com borda preta, fonte Arial Black)
+
+/** Convert #RRGGBB to &H00BBGGRR (ASS BGR format) */
+function hexToASS(hex: string): string {
+  const clean = hex.replace('#', '');
+  const r = clean.substring(0, 2);
+  const g = clean.substring(2, 4);
+  const b = clean.substring(4, 6);
+  return `&H00${b}${g}${r}`.toUpperCase();
+}
+
+function generateSubtitleFile(
+  words: Word[],
+  cutStartTime: number,
+  outputPath: string,
+  options?: {
+    color?: string;
+    highlightColor?: string;
+    position?: string;
+    size?: string;
+    background?: string;
+  }
+): void {
+  // Defaults
+  const primaryColor = hexToASS(options?.highlightColor || '#FFFF00');  // Karaoke highlight color (what shows during speech)
+  const secondaryColor = hexToASS(options?.color || '#FFFFFF');  // Base text color (before karaoke highlight)
+  const outlineColor = '&H00000000'; // Black outline
+
+  // Size mapping
+  const sizeMap: Record<string, number> = { small: 60, medium: 80, large: 100 };
+  const fontSize = sizeMap[options?.size || 'medium'] || 80;
+
+  // Position mapping (MarginV in ASS — higher = further from bottom)
+  const positionMap: Record<string, { marginV: number; alignment: number }> = {
+    bottom: { marginV: 280, alignment: 2 },   // Bottom center
+    center: { marginV: 0, alignment: 5 },      // Middle center
+    top: { marginV: 280, alignment: 8 },        // Top center
+  };
+  const pos = positionMap[options?.position || 'bottom'] || positionMap.bottom;
+
+  // Background style mapping
+  let borderStyle = 1;  // 1 = outline + shadow
+  let outline = 4;
+  let shadow = 0;
+  let backColour = '&H80000000';
+
+  if (options?.background === 'box') {
+    borderStyle = 3;  // 3 = opaque box
+    outline = 2;
+    shadow = 0;
+    backColour = '&H80000000';  // Semi-transparent black box
+  } else if (options?.background === 'outline') {
+    borderStyle = 1;
+    outline = 3;
+    shadow = 0;
+    backColour = '&H00000000';
+  } else {
+    // shadow (default)
+    borderStyle = 1;
+    outline = 4;
+    shadow = 2;
+    backColour = '&H80000000';
+  }
+
   const ASS_HEADER = `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial Black,80,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,10,10,280,1
+Style: Default,Arial Black,${fontSize},${primaryColor},${secondaryColor},${outlineColor},${backColour},-1,0,0,0,100,100,0,0,${borderStyle},${outline},${shadow},${pos.alignment},10,10,${pos.marginV},1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
@@ -451,7 +523,13 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
     let subPathArg: string | undefined;
     if (words && words.length > 0) {
       log.info('Gerando arquivo de legendas...');
-      generateSubtitleFile(words, startTime, subtitlePath);
+      generateSubtitleFile(words, startTime, subtitlePath, {
+        color: (request.body as any).subtitleColor,
+        highlightColor: (request.body as any).subtitleHighlightColor,
+        position: (request.body as any).subtitlePosition,
+        size: (request.body as any).subtitleSize,
+        background: (request.body as any).subtitleBackground,
+      });
       subPathArg = subtitlePath;
     }
 
