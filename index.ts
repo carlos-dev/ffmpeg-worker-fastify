@@ -379,7 +379,7 @@ function runFaceDetection(inputPath: string, outputPath: string, logger: any): F
   return data;
 }
 
-function calculateFaceTrackCrop(faceData: FaceData): string {
+function calculateFaceTrackCrop(faceData: FaceData, logger: any): string {
   const { width, height, detections } = faceData;
 
   // Target crop: 9:16 aspect ratio from original frame
@@ -388,74 +388,32 @@ function calculateFaceTrackCrop(faceData: FaceData): string {
 
   // If video is narrower than 9:16, just center
   if (cropW >= width) {
+    logger.info(`Video narrower than 9:16, centering`);
     return `crop=${width}:${height}:0:0,scale=1080:1920,setsar=1`;
   }
 
   // Filter valid detections (with face found)
-  const validDetections = detections.filter(d => d.x !== null);
+  const validDetections = detections.filter(d => d.x !== null && d.w !== null);
 
   // If no faces detected at all, center crop
   if (validDetections.length === 0) {
     const centerX = Math.round((width - cropW) / 2);
+    logger.info(`No faces detected, centering crop at x=${centerX}`);
     return `crop=${cropW}:${cropH}:${centerX}:0,scale=1080:1920,setsar=1`;
   }
 
-  // Calculate crop X for each detection (center crop on face)
-  const cropPositions: Array<{ time: number; cropX: number } | null> = detections.map(d => {
-    if (d.x === null || d.w === null) return null;
-    const faceCenterX = d.x + d.w / 2;
-    let cropX = Math.round(faceCenterX - cropW / 2);
-    cropX = Math.max(0, Math.min(cropX, width - cropW));
-    return { time: d.time, cropX };
-  });
+  // Calculate median face center X (more robust than average against outliers)
+  const faceCenters = validDetections.map(d => d.x! + d.w! / 2).sort((a, b) => a - b);
+  const medianFaceCenterX = faceCenters[Math.floor(faceCenters.length / 2)];
 
-  // Fill nulls with nearest valid position (forward pass)
-  let lastValid: number | null = null;
-  for (let i = 0; i < cropPositions.length; i++) {
-    if (cropPositions[i] !== null) {
-      lastValid = cropPositions[i]!.cropX;
-    } else if (lastValid !== null) {
-      cropPositions[i] = { time: detections[i].time, cropX: lastValid };
-    }
-  }
-  // Backward pass for nulls at the start
-  lastValid = null;
-  for (let i = cropPositions.length - 1; i >= 0; i--) {
-    if (cropPositions[i] !== null) {
-      lastValid = cropPositions[i]!.cropX;
-    } else if (lastValid !== null) {
-      cropPositions[i] = { time: detections[i].time, cropX: lastValid };
-    }
-  }
+  // Center the crop on the median face position
+  let cropX = Math.round(medianFaceCenterX - cropW / 2);
+  // Clamp to frame bounds
+  cropX = Math.max(0, Math.min(cropX, width - cropW));
 
-  // Apply dead zone: if movement < 5% of frame width, don't move
-  const deadZone = width * 0.05;
-  const smoothed: Array<{ time: number; cropX: number }> = [];
-  let currentX = cropPositions[0]!.cropX;
+  logger.info(`Face tracking: ${validDetections.length} detections, median face center X=${Math.round(medianFaceCenterX)}, crop X=${cropX}, crop size=${cropW}x${cropH}`);
 
-  for (const pos of cropPositions) {
-    if (pos === null) continue;
-    if (Math.abs(pos.cropX - currentX) > deadZone) {
-      currentX = pos.cropX;
-    }
-    smoothed.push({ time: pos.time, cropX: currentX });
-  }
-
-  // Generate sendcmd content
-  let sendcmdContent = '';
-  for (const pos of smoothed) {
-    sendcmdContent += `${pos.time.toFixed(3)} [enter] crop x ${pos.cropX};\n`;
-  }
-
-  // Write sendcmd file
-  const sendcmdPath = path.join(os.tmpdir(), `sendcmd_${randomUUID()}.txt`);
-  fs.writeFileSync(sendcmdPath, sendcmdContent);
-
-  // Initial crop position
-  const initialX = smoothed[0]?.cropX ?? Math.round((width - cropW) / 2);
-
-  const escapedSendcmd = sendcmdPath.replace(/\\/g, '/').replace(/:/g, '\\:');
-  return `sendcmd=f='${escapedSendcmd}',crop=${cropW}:${cropH}:${initialX}:0,scale=1080:1920,setsar=1`;
+  return `crop=${cropW}:${cropH}:${cropX}:0,scale=1080:1920,setsar=1`;
 }
 
 // --- ENGINE FFMPEG (O Coração) ---
@@ -629,7 +587,7 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
       try {
         notifyBackend(jobId, { status: 'rendering', progress: 55, message: 'Detectando rostos...' });
         const faceData = runFaceDetection(inputPath, facesPath, log);
-        faceTrackFilter = calculateFaceTrackCrop(faceData);
+        faceTrackFilter = calculateFaceTrackCrop(faceData, log);
         log.info('Face track filter generated');
       } catch (err) {
         log.warn(`Face detection failed, falling back to crop: ${(err as Error).message}`);
