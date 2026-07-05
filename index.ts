@@ -379,7 +379,7 @@ function runFaceDetection(inputPath: string, outputPath: string, logger: any): F
   return data;
 }
 
-function calculateFaceTrackCrop(faceData: FaceData, logger: any, fps: number): string {
+function calculateFaceTrackCrop(faceData: FaceData, logger: any): string {
   const { width, height, detections } = faceData;
 
   // Target crop: 9:16 aspect ratio from original frame
@@ -402,58 +402,17 @@ function calculateFaceTrackCrop(faceData: FaceData, logger: any, fps: number): s
     return `crop=${cropW}:${cropH}:${centerX}:0,scale=1080:1920,setsar=1`;
   }
 
-  // Calculate crop X for each detection
-  const positions = validDetections.map(d => {
-    const faceCenterX = d.x! + d.w! / 2;
-    let cropX = Math.round(faceCenterX - cropW / 2);
-    cropX = Math.max(0, Math.min(cropX, width - cropW));
-    return cropX;
-  });
+  // Calculate median face center X (robust against outliers)
+  const faceCenters = validDetections.map(d => d.x! + d.w! / 2).sort((a, b) => a - b);
+  const medianFaceCenterX = faceCenters[Math.floor(faceCenters.length / 2)];
 
-  // Fill gaps and smooth: apply dead zone (ignore movements < 5% of frame width)
-  const deadZone = width * 0.05;
-  const smoothed: number[] = [positions[0]];
-  for (let i = 1; i < positions.length; i++) {
-    const last = smoothed[smoothed.length - 1];
-    if (Math.abs(positions[i] - last) > deadZone) {
-      smoothed.push(positions[i]);
-    } else {
-      smoothed.push(last);
-    }
-  }
+  // Center the crop on the median face position
+  let cropX = Math.round(medianFaceCenterX - cropW / 2);
+  cropX = Math.max(0, Math.min(cropX, width - cropW));
 
-  // Build FFmpeg crop expression that changes X over time using lerp
-  // The expression uses frame number (n) to interpolate between keyframes
-  // FFmpeg crop filter supports expressions: https://ffmpeg.org/ffmpeg-filters.html#crop
-  const interval = faceData.detections.length > 1
-    ? (faceData.detections[1].time - faceData.detections[0].time)
-    : 2;
-  const framesPerInterval = Math.round(fps * interval);
+  logger.info(`Face tracking: ${validDetections.length} detections, median face X=${Math.round(medianFaceCenterX)}, cropX=${cropX}, cropSize=${cropW}x${cropH}`);
 
-  // Build a piecewise linear expression for X position
-  // Uses FFmpeg expression: if(lt(n,F1), X1, if(lt(n,F2), lerp(X1,X2,(n-F1)/(F2-F1)), ...))
-  // Simplified: use if/then chain with lerp between keypoints
-  let expr = String(smoothed[smoothed.length - 1]); // fallback: last position
-
-  for (let i = smoothed.length - 2; i >= 0; i--) {
-    const frameStart = i * framesPerInterval;
-    const frameEnd = (i + 1) * framesPerInterval;
-    const xStart = smoothed[i];
-    const xEnd = smoothed[i + 1] !== undefined ? smoothed[i + 1] : xStart;
-
-    if (xStart === xEnd) {
-      // No movement in this segment
-      expr = `if(lt(n\\,${frameEnd})\\,${xStart}\\,${expr})`;
-    } else {
-      // Lerp between positions for smooth transition
-      const lerpExpr = `${xStart}+(${xEnd}-${xStart})*(n-${frameStart})/${framesPerInterval}`;
-      expr = `if(lt(n\\,${frameEnd})\\,${lerpExpr}\\,${expr})`;
-    }
-  }
-
-  logger.info(`Face tracking: ${validDetections.length} detections, ${smoothed.length} keyframes, interval=${interval}s`);
-
-  return `crop=${cropW}:${cropH}:'${expr}':0,scale=1080:1920,setsar=1`;
+  return `crop=${cropW}:${cropH}:${cropX}:0,scale=1080:1920,setsar=1`;
 }
 
 // --- ENGINE FFMPEG (O Coração) ---
@@ -627,7 +586,7 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
       try {
         notifyBackend(jobId, { status: 'rendering', progress: 55, message: 'Detectando rostos...' });
         const faceData = runFaceDetection(inputPath, facesPath, log);
-        faceTrackFilter = calculateFaceTrackCrop(faceData, log, faceData.fps);
+        faceTrackFilter = calculateFaceTrackCrop(faceData, log);
         log.info('Face track filter generated');
       } catch (err) {
         log.warn(`Face detection failed, falling back to crop: ${(err as Error).message}`);
