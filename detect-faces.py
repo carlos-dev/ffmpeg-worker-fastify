@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Face detection script for CutCast face-track render mode.
-Analyzes video frames at regular intervals and outputs face positions as JSON.
+Uses OpenCV Haar Cascade (built into opencv-python-headless, no extra dependencies).
 
 Usage: python3 detect-faces.py --input video.mp4 --output faces.json --interval 0.5
 """
@@ -10,7 +10,7 @@ import argparse
 import json
 import sys
 import cv2
-import mediapipe as mp
+import os
 
 
 def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
@@ -27,10 +27,13 @@ def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
 
     print(f"Video: {width}x{height} @ {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
 
-    face_detection = mp.solutions.face_detection.FaceDetection(
-        model_selection=1,  # 1 = full range (better for far faces)
-        min_detection_confidence=0.5
-    )
+    # Use OpenCV's built-in Haar Cascade for face detection
+    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    if not os.path.exists(cascade_path):
+        print(f"Error: Haar cascade not found at {cascade_path}", file=sys.stderr)
+        sys.exit(1)
+
+    face_cascade = cv2.CascadeClassifier(cascade_path)
 
     detections = []
     frame_interval = int(fps * interval)
@@ -46,36 +49,33 @@ def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
             break
 
         if frame_idx % frame_interval == 0:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_detection.process(rgb_frame)
-
             time_sec = frame_idx / fps
+
+            # Convert to grayscale for Haar cascade
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Detect faces
+            faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(int(width * 0.05), int(height * 0.05))  # Min face size: 5% of frame
+            )
+
             detection = None
 
-            if results.detections:
-                # Pick face with highest confidence
-                best = max(results.detections, key=lambda d: d.score[0])
-                bbox = best.location_data.relative_bounding_box
-
-                # Convert relative coords to absolute pixels
-                x = int(bbox.xmin * width)
-                y = int(bbox.ymin * height)
-                w = int(bbox.width * width)
-                h = int(bbox.height * height)
-
-                # Clamp to frame bounds
-                x = max(0, min(x, width - 1))
-                y = max(0, min(y, height - 1))
-                w = min(w, width - x)
-                h = min(h, height - y)
+            if len(faces) > 0:
+                # Pick the largest face (most likely the main subject)
+                largest = max(faces, key=lambda f: f[2] * f[3])
+                x, y, w, h = largest
 
                 detection = {
                     "time": round(time_sec, 3),
-                    "x": x,
-                    "y": y,
-                    "w": w,
-                    "h": h,
-                    "confidence": round(best.score[0], 3)
+                    "x": int(x),
+                    "y": int(y),
+                    "w": int(w),
+                    "h": int(h),
+                    "confidence": 0.9
                 }
             else:
                 detection = {
@@ -93,7 +93,6 @@ def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
         frame_idx += 1
 
     cap.release()
-    face_detection.close()
 
     output = {
         "fps": fps,
