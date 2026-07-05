@@ -371,9 +371,9 @@ interface FaceData {
 
 function runFaceDetection(inputPath: string, outputPath: string, logger: any): FaceData {
   const scriptPath = path.resolve(__dirname, '..', 'detect-faces.py');
-  const cmd = `python3 "${scriptPath}" --input "${inputPath}" --output "${outputPath}" --interval 0.5`;
+  const cmd = `python3 "${scriptPath}" --input "${inputPath}" --output "${outputPath}" --interval 2`;
   logger.info(`Running face detection: ${cmd}`);
-  execSync(cmd, { timeout: 120000 });
+  execSync(cmd, { timeout: 300000 });
   const data = JSON.parse(fs.readFileSync(outputPath, 'utf-8'));
   logger.info(`Face detection complete: ${data.detections.length} samples`);
   return data;
