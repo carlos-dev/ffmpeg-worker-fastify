@@ -369,9 +369,12 @@ interface FaceData {
   detections: FaceDetection[];
 }
 
-function runFaceDetection(inputPath: string, outputPath: string, logger: any): FaceData {
+function runFaceDetection(inputPath: string, outputPath: string, logger: any, startTime?: number, endTime?: number): FaceData {
   const scriptPath = path.resolve(__dirname, '..', 'detect-faces.py');
-  const cmd = `python3 "${scriptPath}" --input "${inputPath}" --output "${outputPath}" --interval 2`;
+  let cmd = `python3 "${scriptPath}" --input "${inputPath}" --output "${outputPath}" --interval 2`;
+  if (startTime !== undefined && endTime !== undefined) {
+    cmd += ` --start ${startTime.toFixed(3)} --end ${endTime.toFixed(3)}`;
+  }
   logger.info(`Running face detection: ${cmd}`);
   execSync(cmd, { timeout: 300000 });
   const data = JSON.parse(fs.readFileSync(outputPath, 'utf-8'));
@@ -585,7 +588,7 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
       const facesPath = path.join(tempDir, `faces_${executionId}.json`);
       try {
         notifyBackend(jobId, { status: 'rendering', progress: 55, message: 'Detectando rostos...' });
-        const faceData = runFaceDetection(inputPath, facesPath, log);
+        const faceData = runFaceDetection(inputPath, facesPath, log, startTime, endTime);
         faceTrackFilter = calculateFaceTrackCrop(faceData, log);
         log.info('Face track filter generated');
       } catch (err) {

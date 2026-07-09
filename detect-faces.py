@@ -30,7 +30,7 @@ def get_model_path():
     return model_path
 
 
-def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
+def detect_faces(input_path: str, output_path: str, interval: float = 0.5, start_time: float = 0, end_time: float = 0):
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         print(f"Error: Cannot open video {input_path}", file=sys.stderr)
@@ -42,7 +42,17 @@ def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
 
-    print(f"Video: {width}x{height} @ {fps:.1f}fps, {duration:.1f}s, {total_frames} frames")
+    # If start/end provided, only analyze that segment
+    start_frame = 0
+    end_frame = total_frames
+    if start_time > 0:
+        start_frame = int(start_time * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    if end_time > 0:
+        end_frame = int(end_time * fps)
+
+    segment_duration = (end_frame - start_frame) / fps if fps > 0 else duration
+    print(f"Video: {width}x{height} @ {fps:.1f}fps, analyzing {segment_duration:.1f}s (of {duration:.1f}s total)")
 
     # Initialize YuNet face detector
     model_path = get_model_path()
@@ -60,15 +70,15 @@ def detect_faces(input_path: str, output_path: str, interval: float = 0.5):
     if frame_interval < 1:
         frame_interval = 1
 
-    frame_idx = 0
+    frame_idx = start_frame
     analyzed = 0
 
-    while True:
+    while frame_idx < end_frame:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_idx % frame_interval == 0:
+        if (frame_idx - start_frame) % frame_interval == 0:
             time_sec = frame_idx / fps
 
             # Detect faces
@@ -138,6 +148,8 @@ if __name__ == '__main__':
     parser.add_argument('--input', required=True, help='Input video path')
     parser.add_argument('--output', required=True, help='Output JSON path')
     parser.add_argument('--interval', type=float, default=0.5, help='Analysis interval in seconds')
+    parser.add_argument('--start', type=float, default=0, help='Start time in seconds')
+    parser.add_argument('--end', type=float, default=0, help='End time in seconds')
     args = parser.parse_args()
 
-    detect_faces(args.input, args.output, args.interval)
+    detect_faces(args.input, args.output, args.interval, args.start, args.end)
