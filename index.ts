@@ -9,6 +9,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { randomUUID } from 'crypto';
 import ffmpegStaticPath from 'ffmpeg-static';
+import { buildFilterGraph } from './filters.js';
 
 // Prefere o FFmpeg do sistema (instalado via apt-get, tem drawtext/libfreetype)
 // Fallback para ffmpeg-static (npm, build minimalista SEM drawtext)
@@ -27,6 +28,19 @@ const ffmpegBinary = resolveFFmpegBinary();
 // --- SETUP INICIAL ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// --- WATERMARK ---
+const WATERMARK_OPACITY = 0.4;
+const WATERMARK_Y_OFFSET = 200; // px abaixo do centro (frame 1080x1920)
+
+// Em dev (tsx) __dirname é a raiz do projeto; em prod (dist/) é um nível abaixo
+function resolveWatermarkPath(): string | undefined {
+  const candidates = [
+    path.resolve(__dirname, 'assets', 'watermark-overlay.png'),
+    path.resolve(__dirname, '..', 'assets', 'watermark-overlay.png'),
+  ];
+  return candidates.find((p) => fs.existsSync(p));
+}
 
 const fastify = Fastify({
   logger: true,
@@ -104,6 +118,7 @@ interface ProcessVideoBody {
   renderStyle?: 'blur' | 'crop' | 'face-track';
   hasViralTitle?: boolean;
   viralHeadline?: string;
+  shouldWatermark?: boolean;
   // Subtitle style params
   subtitleColor?: string;           // hex color like '#FFFFFF'
   subtitleHighlightColor?: string;  // hex color like '#FFFF00'
@@ -125,6 +140,7 @@ const processSchema = {
       renderStyle: { type: 'string', enum: ['blur', 'crop', 'face-track'], default: 'blur' },
       hasViralTitle: { type: 'boolean', default: false },
       viralHeadline: { type: 'string' },
+      shouldWatermark: { type: 'boolean', default: false },
       subtitleColor: { type: 'string' },
       subtitleHighlightColor: { type: 'string' },
       subtitlePosition: { type: 'string' },
@@ -429,7 +445,8 @@ function runFFmpeg(
   logger: any,
   renderStyle: 'blur' | 'crop' | 'face-track' = 'blur',
   viralHeadline?: string,
-  faceTrackFilter?: string
+  faceTrackFilter?: string,
+  watermarkPath?: string
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const duration = endTime - startTime;
@@ -437,23 +454,25 @@ function runFFmpeg(
     const fadeOutStart = Math.max(0, duration - 0.5);
     const audioFilter = `afade=t=in:st=0:d=0.1,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=0.5`;
 
-    let videoFilter: string;
+    let styleFilter: string;
 
     if (renderStyle === 'face-track' && faceTrackFilter) {
-      videoFilter = faceTrackFilter;
+      styleFilter = faceTrackFilter;
     } else if (renderStyle === 'crop') {
-      videoFilter = `scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1`;
+      styleFilter = `scale=-1:1920:flags=lanczos,crop=1080:1920:(iw-1080)/2:0,setsar=1`;
     } else {
-      videoFilter = `split[bg][fg]; [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,eq=brightness=-0.1[bg_blurred]; [fg]scale=1080:-1:flags=lanczos[fg_sharp]; [bg_blurred][fg_sharp]overlay=(W-w)/2:(H-h)/2,setsar=1`;
+      styleFilter = `split[bg][fg]; [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10,eq=brightness=-0.1[bg_blurred]; [fg]scale=1080:-1:flags=lanczos[fg_sharp]; [bg_blurred][fg_sharp]overlay=(W-w)/2:(H-h)/2,setsar=1`;
     }
 
     // Remove quebras de linha da string de filtro (segurança)
-    videoFilter = videoFilter.replace(/\n/g, '');
+    styleFilter = styleFilter.replace(/\n/g, '');
+
+    const textFilters: string[] = [];
 
     // Adiciona legendas se existirem
     if (subtitlePath && fs.existsSync(subtitlePath)) {
       const escapedPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
-      videoFilter += `,subtitles='${escapedPath}'`;
+      textFilters.push(`subtitles='${escapedPath}'`);
     }
 
     // --- TÍTULO VIRAL (drawtext) ---
@@ -478,46 +497,55 @@ function runFFmpeg(
         for (let i = 0; i < lines.length; i++) {
           const escapedLine = escapeDrawtext(lines[i]);
           const yPos = baseY + (i * lineHeight);
-          videoFilter += `,drawtext=fontfile='${fontPathEscaped}':text='${escapedLine}':fontcolor=white:fontsize=${fontSize}:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=${yPos}`;
+          textFilters.push(`drawtext=fontfile='${fontPathEscaped}':text='${escapedLine}':fontcolor=white:fontsize=${fontSize}:borderw=2:bordercolor=black:box=1:boxcolor=red@1.0:boxborderw=15:x=(w-text_w)/2:y=${yPos}`);
         }
       }
     }
 
-    const args = [
-      '-y',
-      '-ss', startTime.toFixed(3),
-      '-i', inputPath,
+    const graph = buildFilterGraph({
+      styleFilter,
+      textFilters,
+      watermark: watermarkPath
+        ? { opacity: WATERMARK_OPACITY, yOffset: WATERMARK_Y_OFFSET }
+        : undefined,
+    });
+
+    const args = ['-y', '-ss', startTime.toFixed(3), '-i', inputPath];
+    if (watermarkPath) {
+      args.push('-i', watermarkPath);
+    }
+    args.push(
       '-t', duration.toFixed(3),
-      
+
       // Usa threads baseadas no plano Pro (ajuda na velocidade)
       '-threads', '4',
 
-      '-map', '0:v:0',
+      graph.kind, graph.filter,
+      '-map', graph.videoMap,
       '-map', '0:a:0?',
-      '-vf', videoFilter,
       '-af', audioFilter,
-      
+
       // --- QUALIDADE DE VÍDEO (Ajustado para Pro Plan) ---
       '-c:v', 'libx264',
       '-preset', 'fast',  // 'fast' é o equilíbrio perfeito. 'veryslow' é desnecessário.
       '-crf', '23',       // 23 = Alta qualidade visual, arquivo tamanho médio.
-      
+
       // Limites de Bitrate (Segurança para Mobile)
       '-maxrate', '6000k',
       '-bufsize', '12000k',
-      
+
       '-profile:v', 'high',
       '-pix_fmt', 'yuv420p',
-      
+
       // Áudio
       '-c:a', 'aac',
       '-b:a', '192k',
       '-ar', '44100',
-      
+
       '-movflags', '+faststart',
-      
+
       outputPath
-    ];
+    );
 
     logger.info(`Iniciando FFmpeg (${ffmpegBinary})...`);
     
@@ -562,7 +590,7 @@ function runFFmpeg(
 fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
   schema: processSchema
 }, async (request, reply) => {
-  const { videoUrl, startTime, endTime, jobId, words, renderStyle, hasViralTitle, viralHeadline } = request.body;
+  const { videoUrl, startTime, endTime, jobId, words, renderStyle, hasViralTitle, viralHeadline, shouldWatermark } = request.body;
   const style = renderStyle || 'blur';
   const headline = (hasViralTitle && viralHeadline) ? viralHeadline : undefined;
   const log = request.log;
@@ -613,11 +641,20 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
     }
 
     // 3. Renderização (60% -> 90%)
-    log.info(`Iniciando renderização FFmpeg [${style}]${headline ? ' + Título Viral' : ''} High Quality...`);
+    // Watermark: fail-safe — se o asset sumir, loga e renderiza sem marca (job nunca falha por isso)
+    let watermarkPath: string | undefined;
+    if (shouldWatermark) {
+      watermarkPath = resolveWatermarkPath();
+      if (!watermarkPath) {
+        log.warn('shouldWatermark=true mas assets/watermark-overlay.png não foi encontrado. Renderizando sem marca.');
+      }
+    }
+
+    log.info(`Iniciando renderização FFmpeg [${style}]${headline ? ' + Título Viral' : ''}${watermarkPath ? ' + Watermark' : ''} High Quality...`);
     await runFFmpeg(inputPath, outputPath, startTime, endTime, subPathArg, (pct) => {
       const globalPct = 60 + (pct / 100) * 30;
       notifyBackend(jobId, { status: 'rendering', progress: Math.floor(globalPct) });
-    }, log, style, headline, faceTrackFilter);
+    }, log, style, headline, faceTrackFilter, watermarkPath);
 
     // 4. Upload (90% -> 100%)
     notifyBackend(jobId, { status: 'uploading', progress: 95, message: 'Enviando para nuvem...' });
