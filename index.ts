@@ -31,7 +31,7 @@ const __dirname = path.dirname(__filename);
 
 // --- WATERMARK ---
 const WATERMARK_OPACITY = 0.4;
-const WATERMARK_Y_OFFSET = 200; // px abaixo do centro (frame 1080x1920)
+const WATERMARK_Y_OFFSET = 400; // px abaixo do centro (frame 1080x1920)
 
 // Em dev (tsx) __dirname é a raiz do projeto; em prod (dist/) é um nível abaixo
 function resolveWatermarkPath(): string | undefined {
