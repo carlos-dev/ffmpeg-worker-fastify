@@ -692,6 +692,11 @@ fastify.post<{ Body: ProcessVideoBody }>('/process-video', {
 fastify.get('/health', async () => ({ status: 'ok' }));
 
 const start = async () => {
+  // Check de startup: watermark ausente deve ser visível no deploy, não no primeiro render
+  if (!resolveWatermarkPath()) {
+    fastify.log.error('assets/watermark-overlay.png não encontrado — cortes com shouldWatermark=true sairão SEM marca d\'água');
+  }
+
   const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
   await fastify.listen({ port, host: '0.0.0.0' });
   console.log(`Worker rodando na porta ${port}`);
